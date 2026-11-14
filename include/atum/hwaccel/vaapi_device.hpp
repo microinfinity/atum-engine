@@ -3,12 +3,18 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <vector>
 #include "atum/hwaccel/hwaccel.hpp"
 #include "atum/codec/codec_id.hpp"
 
 namespace atum {
+
+struct VaDeviceLifetime {
+    std::mutex mutex;
+    bool alive{false};
+};
 
 /// Sovereign VA-API Hardware Device for Intel/AMD GPU video decoding & zero-copy scanout.
 class VaapiDevice : public HwDevice {
@@ -67,8 +73,20 @@ public:
     /// Exports decoded hardware surface to DRM DMA-BUF PRIME file descriptors.
     MediaResult<void> export_surface_dma_buf(uint32_t surface_id, HwBufferDescriptor& desc);
 
-    /// Maps or derives hardware surface directly into a VideoFrame.
-    MediaResult<VideoFrame> derive_surface_to_frame(uint32_t surface_id, uint32_t width, uint32_t height);
+    /// Maps or derives hardware surface directly into a CPU-accessible VideoFrame.
+    MediaResult<VideoFrame> derive_surface_to_frame(uint32_t surface_id, uint32_t width, uint32_t height, PixelFormat preferred_format = PixelFormat::NV12);
+
+    /// Creates a lazy GPU-backed VideoFrame without stalling or copying pixels to CPU.
+    MediaResult<VideoFrame> create_lazy_hw_frame(
+        uint32_t surface_id,
+        uint32_t width,
+        uint32_t height,
+        PixelFormat format = PixelFormat::NV12,
+        std::shared_ptr<void> surface_lease = {}
+    );
+
+    /// Lifetime guard shared with lazy VideoFrame backings.
+    [[nodiscard]] const std::shared_ptr<VaDeviceLifetime>& lifetime_token() const noexcept { return lifetime_; }
 
     /// Creates and initializes a VA-API device by probing available Linux DRM render nodes (/dev/dri/renderD128..).
     static std::unique_ptr<VaapiDevice> create();
@@ -79,6 +97,7 @@ private:
     void* libva_drm_handle_{nullptr};
     void* va_display_{nullptr};
     bool is_initialized_{false};
+    std::shared_ptr<VaDeviceLifetime> lifetime_;
 
     void init_internal() noexcept;
     void close_internal() noexcept;

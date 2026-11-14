@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -51,6 +52,33 @@ private:
     uint32_t width_{0};
     uint32_t height_{0};
     uint32_t drm_fourcc_{0};
+};
+
+/// Zero-copy per-plane GL_TEXTURE_2D views backed by Linux DMA-BUF EGLImages.
+/// Enables hardware-accelerated shader YUV->RGB conversion on Desktop OpenGL
+/// Core profiles where GL_TEXTURE_EXTERNAL_OES is unavailable.
+struct GlPlanarTextures {
+    std::array<GlTexture, 3> planes{};
+    uint32_t plane_count{0};
+    uint32_t drm_fourcc{0};
+    uint32_t width{0};
+    uint32_t height{0};
+    ColorSpace color_space{ColorSpace::BT709};
+    ColorRange color_range{ColorRange::Studio};
+
+    [[nodiscard]] bool is_valid() const noexcept {
+        return plane_count > 0 && planes[0].is_valid();
+    }
+
+    void reset() noexcept {
+        for (auto& plane : planes) {
+            plane.reset();
+        }
+        plane_count = 0;
+        drm_fourcc = 0;
+        width = 0;
+        height = 0;
+    }
 };
 
 } // namespace atum::gl

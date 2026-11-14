@@ -13,6 +13,57 @@
 
 namespace atum {
 
+/// Exported DRM PRIME DMA-BUF plane & modifier descriptor owned by HwFrameBacking.
+struct HwFrameBufferLayout {
+    uint32_t width{0};
+    uint32_t height{0};
+    uint32_t drm_fourcc{0};
+    uint32_t num_planes{0};
+    uint32_t num_objects{0};
+    std::array<int32_t, 4> fds{-1, -1, -1, -1};
+    std::array<uint32_t, 4> strides{};
+    std::array<uint32_t, 4> offsets{};
+    std::array<uint64_t, 4> modifiers{};
+    std::array<uint32_t, 4> object_indices{};
+    uint64_t modifier{0};
+
+    [[nodiscard]] int32_t plane_fd(size_t plane_idx) const noexcept {
+        if (plane_idx >= 4) return -1;
+        uint32_t obj = object_indices[plane_idx];
+        if (obj < 4 && fds[obj] >= 0) return fds[obj];
+        return fds[plane_idx] >= 0 ? fds[plane_idx] : fds[0];
+    }
+
+    [[nodiscard]] uint64_t plane_modifier(size_t plane_idx) const noexcept {
+        if (plane_idx >= 4) return modifier;
+        return modifiers[plane_idx] != 0 ? modifiers[plane_idx] : modifier;
+    }
+};
+
+/// Abstract lazy GPU-surface backing (defers vaSyncSurface / vaGetImage / vaExportSurfaceHandle until needed).
+class HwFrameBacking {
+public:
+    virtual ~HwFrameBacking() = default;
+
+    [[nodiscard]] virtual uint32_t surface_id() const noexcept = 0;
+
+    /// Lazily synchronizes and downloads GPU surface pixels into CPU planes/strides once.
+    virtual bool ensure_cpu_mapped(
+        PixelFormat& inout_format,
+        std::array<uint8_t*, 4>& out_planes,
+        std::array<size_t, 4>& out_strides
+    ) noexcept = 0;
+
+    /// Lazily exports PRIME DMA-BUF FDs (owned by backing and closed in destructor).
+    [[nodiscard]] virtual const HwFrameBufferLayout* export_dma_buf(bool sync_first = true) noexcept = 0;
+
+    /// Returns already-exported primary DMA-BUF FD without triggering a new export syscall.
+    [[nodiscard]] virtual int32_t cached_dma_buf_fd() const noexcept = 0;
+
+    /// Materializes CPU pixels if needed and releases the underlying surface pool lease.
+    virtual void detach_surface_to_cpu() noexcept = 0;
+};
+
 /// Decoded uncompressed multi-planar video frame.
 class VideoFrame : public Frame {
 public:
@@ -24,8 +75,8 @@ public:
     VideoFrame(const VideoFrame& other);
     VideoFrame& operator=(const VideoFrame& other);
 
-    VideoFrame(VideoFrame&& other) noexcept = default;
-    VideoFrame& operator=(VideoFrame&& other) noexcept = default;
+    VideoFrame(VideoFrame&& other) noexcept;
+    VideoFrame& operator=(VideoFrame&& other) noexcept;
 
     /// Allocates an owned video surface with 32-byte SIMD row alignment.
     static VideoFrame allocate(uint32_t width, uint32_t height, PixelFormat format);
@@ -48,8 +99,17 @@ public:
         const std::array<size_t, MAX_PLANES>& strides
     ) noexcept;
 
+    /// Creates a lazy GPU-backed VideoFrame without downloading pixels to CPU.
+    static VideoFrame from_hw_backing(
+        uint32_t width,
+        uint32_t height,
+        PixelFormat format,
+        std::shared_ptr<HwFrameBacking> backing
+    ) noexcept;
+
     [[nodiscard]] bool is_valid() const noexcept override {
-        return width_ > 0 && height_ > 0 && format_ != PixelFormat::Unknown && planes_[0] != nullptr;
+        return width_ > 0 && height_ > 0 && format_ != PixelFormat::Unknown &&
+               (planes_[0] != nullptr || hw_backing_ != nullptr);
     }
 
     [[nodiscard]] uint32_t width() const noexcept { return width_; }
@@ -73,7 +133,9 @@ public:
     }
 
     [[nodiscard]] const uint8_t* plane(size_t index) const noexcept {
-        return index < MAX_PLANES ? planes_[index] : nullptr;
+        if (index >= MAX_PLANES) return nullptr;
+        if (!planes_[0] && hw_backing_) materialize_cpu_backing();
+        return planes_[index];
     }
 
     [[nodiscard]] uint8_t* plane_mut(size_t index) noexcept {
@@ -91,7 +153,9 @@ public:
     }
 
     [[nodiscard]] size_t stride(size_t index) const noexcept {
-        return index < MAX_PLANES ? strides_[index] : 0;
+        if (index >= MAX_PLANES) return 0;
+        if (strides_[index] == 0 && !planes_[0] && hw_backing_) materialize_cpu_backing();
+        return strides_[index];
     }
 
     [[nodiscard]] uint32_t plane_width(size_t index) const noexcept;
@@ -99,6 +163,7 @@ public:
 
     void ensure_owned();
     [[nodiscard]] VideoFrame clone() const;
+    [[nodiscard]] VideoFrame shallow_hw_ref() const;
 
     /// Saves frame directly to an image file (.png, .jpg, .webp, .qoi, .bmp) using sovereign Nisaba engine.
     [[nodiscard]] MediaResult<void> save_image(const std::string& path, int quality_or_compression = 90) const;
@@ -107,28 +172,48 @@ public:
     [[nodiscard]] MediaResult<void> save_png(const std::string& path, int compression_level = 6) const;
 
     // --- Hardware Acceleration & Zero-Copy Properties ---
-    [[nodiscard]] bool is_hw_frame() const noexcept { return is_hw_frame_; }
+    [[nodiscard]] bool is_hw_frame() const noexcept { return is_hw_frame_ || hw_backing_ != nullptr; }
     void set_hw_frame(bool hw) noexcept { is_hw_frame_ = hw; }
 
-    [[nodiscard]] uint32_t hw_surface_id() const noexcept { return hw_surface_id_; }
+    [[nodiscard]] uint32_t hw_surface_id() const noexcept {
+        return hw_backing_ ? hw_backing_->surface_id() : hw_surface_id_;
+    }
     void set_hw_surface_id(uint32_t id) noexcept { hw_surface_id_ = id; if (id != 0xFFFFFFFF) is_hw_frame_ = true; }
 
-    [[nodiscard]] int32_t dma_buf_fd() const noexcept { return dma_buf_fd_; }
+    [[nodiscard]] int32_t dma_buf_fd() const noexcept {
+        if (dma_buf_fd_ >= 0) return dma_buf_fd_;
+        if (hw_backing_) {
+            const HwFrameBufferLayout* layout = hw_backing_->export_dma_buf(true);
+            return layout ? layout->plane_fd(0) : -1;
+        }
+        return -1;
+    }
     void set_dma_buf_fd(int32_t fd) noexcept { dma_buf_fd_ = fd; if (fd >= 0) is_hw_frame_ = true; }
 
     [[nodiscard]] uint64_t hw_opaque_handle() const noexcept { return hw_opaque_handle_; }
     void set_hw_opaque_handle(uint64_t handle) noexcept { hw_opaque_handle_ = handle; if (handle != 0) is_hw_frame_ = true; }
 
+    [[nodiscard]] const std::shared_ptr<HwFrameBacking>& hw_backing() const noexcept { return hw_backing_; }
+    void set_hw_backing(std::shared_ptr<HwFrameBacking> backing) noexcept {
+        hw_backing_ = std::move(backing);
+        if (hw_backing_) {
+            is_hw_frame_ = true;
+            hw_surface_id_ = hw_backing_->surface_id();
+        }
+    }
+
 private:
+    void materialize_cpu_backing() const noexcept;
+
     uint32_t width_{0};
     uint32_t height_{0};
-    PixelFormat format_{PixelFormat::Unknown};
+    mutable PixelFormat format_{PixelFormat::Unknown};
     ColorRange range_{ColorRange::Studio};
     ColorSpace space_{ColorSpace::BT709};
     HdrMetadata hdr_meta_{};
 
-    std::array<uint8_t*, MAX_PLANES> planes_{};
-    std::array<size_t, MAX_PLANES> strides_{};
+    mutable std::array<uint8_t*, MAX_PLANES> planes_{};
+    mutable std::array<size_t, MAX_PLANES> strides_{};
 
     std::vector<uint8_t> owned_buffer_;
     bool is_owned_{false};
@@ -137,6 +222,7 @@ private:
     uint32_t hw_surface_id_{0xFFFFFFFF};
     int32_t dma_buf_fd_{-1};
     uint64_t hw_opaque_handle_{0};
+    std::shared_ptr<HwFrameBacking> hw_backing_;
 };
 
 } // namespace atum

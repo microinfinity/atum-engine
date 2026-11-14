@@ -72,6 +72,42 @@ MediaResult<void> HevcParser::parse_nal(std::span<const uint8_t> nal_data) {
     if (!hdr) return hdr.error();
 
     auto payload = nal_data.subspan(2);
+
+    if (hevc_is_vcl_nal(hdr->nal_unit_type)) {
+        auto* sps = active_sps();
+        auto* pps = active_pps();
+        if (sps && pps) {
+            uint8_t header_rbsp[512];
+            size_t header_rbsp_len = 0;
+            const size_t scan_limit = std::min<size_t>(payload.size(), 512);
+            size_t zero_count = 0;
+            for (size_t i = 0; i < scan_limit; ++i) {
+                uint8_t b = payload[i];
+                if (zero_count >= 2 && b == 0x03 && i + 1 < payload.size() && payload[i + 1] <= 0x03) {
+                    zero_count = 0;
+                    continue;
+                }
+                zero_count = (b == 0x00) ? (zero_count + 1) : 0;
+                header_rbsp[header_rbsp_len++] = b;
+            }
+
+            BitReader reader(std::span<const uint8_t>(header_rbsp, header_rbsp_len));
+            auto res = HevcSliceHeader::parse(reader, hdr->nal_unit_type, *sps, *pps, nal_data);
+            if (res) {
+                if (res->slice_pic_parameter_set_id != pps->pps_pic_parameter_set_id) {
+                    auto it = pps_map_.find(res->slice_pic_parameter_set_id);
+                    if (it != pps_map_.end()) {
+                        active_pps_id_ = it->first;
+                        auto sps_it = sps_map_.find(it->second.pps_seq_parameter_set_id);
+                        if (sps_it != sps_map_.end()) active_sps_id_ = sps_it->first;
+                    }
+                }
+                last_slice_ = *res;
+            }
+        }
+        return {};
+    }
+
     auto rbsp = NalParser::ebsp_to_rbsp(payload);
 
     if (hdr->nal_unit_type == HevcNalType::VPS_NUT) {
@@ -98,27 +134,6 @@ MediaResult<void> HevcParser::parse_nal(std::span<const uint8_t> nal_data) {
         uint32_t id = res->pps_pic_parameter_set_id;
         pps_map_[id] = std::move(*res);
         if (!active_pps_id_.has_value()) active_pps_id_ = id;
-        return {};
-    }
-
-    if (hevc_is_vcl_nal(hdr->nal_unit_type)) {
-        auto* sps = active_sps();
-        auto* pps = active_pps();
-        if (sps && pps) {
-            BitReader reader(rbsp);
-            auto res = HevcSliceHeader::parse(reader, hdr->nal_unit_type, *sps, *pps, nal_data);
-            if (res) {
-                if (res->slice_pic_parameter_set_id != pps->pps_pic_parameter_set_id) {
-                    auto it = pps_map_.find(res->slice_pic_parameter_set_id);
-                    if (it != pps_map_.end()) {
-                        active_pps_id_ = it->first;
-                        auto sps_it = sps_map_.find(it->second.pps_seq_parameter_set_id);
-                        if (sps_it != sps_map_.end()) active_sps_id_ = sps_it->first;
-                    }
-                }
-                last_slice_ = *res;
-            }
-        }
         return {};
     }
 

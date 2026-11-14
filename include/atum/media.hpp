@@ -32,10 +32,9 @@
 #include "atum/container/wav_container.hpp"
 #include "atum/container/ivf_container.hpp"
 #include "atum/container/isobmff_demuxer.hpp"
+#include "atum/container/container_registry.hpp"
 #include "atum/hwaccel/hwaccel.hpp"
 #include "atum/parallel/thread_pool.hpp"
-#include "atum/parallel/hevc_wpp.hpp"
-#include "atum/parallel/av1_tile_grid.hpp"
 #include "atum/parallel/frame_graph.hpp"
 
 // --- Nisaba 2D Engine Integration Bridge ---
@@ -45,6 +44,106 @@
 
 namespace atum {
 
+/// Directly blits a VideoFrame into an existing Nisaba mutable Pixmap surface without heap allocation.
+inline bool blit_to_pixmap(const VideoFrame& frame, nisaba::PixmapMut& target) {
+    if (!frame.is_valid() || target.width() < frame.width() || target.height() < frame.height()) {
+        return false;
+    }
+
+    const PixelFormat fmt = frame.pixel_format();
+    if (fmt == PixelFormat::RGBA32) {
+        const uint8_t* base = frame.plane(0);
+        const size_t src_stride = frame.stride(0);
+        const size_t row_bytes = static_cast<size_t>(frame.width()) * 4;
+        for (uint32_t y = 0; y < frame.height(); ++y) {
+            std::memcpy(reinterpret_cast<uint8_t*>(target.row(y)), base + y * src_stride, row_bytes);
+        }
+        return true;
+    }
+
+    if (fmt == PixelFormat::NV12) {
+        ColorConverter::nv12_to_rgba(
+            frame.plane(0), frame.stride(0),
+            frame.plane(1), frame.stride(1),
+            target.data_mut(), target.stride_bytes(),
+            frame.width(), frame.height(),
+            frame.color_space(), frame.color_range()
+        );
+        return true;
+    }
+
+    if (fmt == PixelFormat::YUV420P) {
+        ColorConverter::yuv420p_to_rgba(
+            frame.plane(0), frame.stride(0),
+            frame.plane(1), frame.stride(1),
+            frame.plane(2), frame.stride(2),
+            target.data_mut(), target.stride_bytes(),
+            frame.width(), frame.height(),
+            frame.color_space(), frame.color_range()
+        );
+        return true;
+    }
+
+    if (fmt == PixelFormat::P010) {
+        ColorConverter::p010_to_rgba(
+            frame.plane16(0), frame.stride(0),
+            frame.plane16(1), frame.stride(1),
+            target.data_mut(), target.stride_bytes(),
+            frame.width(), frame.height(),
+            frame.color_space(), frame.color_range()
+        );
+        return true;
+    }
+
+    if (fmt == PixelFormat::YUV420P10) {
+        ColorConverter::yuv420p10_to_rgba(
+            frame.plane16(0), frame.stride(0),
+            frame.plane16(1), frame.stride(1),
+            frame.plane16(2), frame.stride(2),
+            target.data_mut(), target.stride_bytes(),
+            frame.width(), frame.height(),
+            frame.color_space(), frame.color_range()
+        );
+        return true;
+    }
+
+    if (fmt == PixelFormat::YUV422P) {
+        ColorConverter::yuv422p_to_rgba(
+            frame.plane(0), frame.stride(0),
+            frame.plane(1), frame.stride(1),
+            frame.plane(2), frame.stride(2),
+            target.data_mut(), target.stride_bytes(),
+            frame.width(), frame.height(),
+            frame.color_space(), frame.color_range()
+        );
+        return true;
+    }
+
+    if (fmt == PixelFormat::YUV444P) {
+        ColorConverter::yuv444p_to_rgba(
+            frame.plane(0), frame.stride(0),
+            frame.plane(1), frame.stride(1),
+            frame.plane(2), frame.stride(2),
+            target.data_mut(), target.stride_bytes(),
+            frame.width(), frame.height(),
+            frame.color_space(), frame.color_range()
+        );
+        return true;
+    }
+
+    auto converted = ColorConverter::convert(frame, PixelFormat::RGBA32);
+    if (!converted.is_valid()) {
+        return false;
+    }
+    const uint8_t* base = converted.plane(0);
+    const size_t src_stride = converted.stride(0);
+    const size_t row_bytes = static_cast<size_t>(converted.width()) * 4;
+    for (uint32_t y = 0; y < converted.height(); ++y) {
+        std::memcpy(reinterpret_cast<uint8_t*>(target.row(y)), base + y * src_stride, row_bytes);
+    }
+    return true;
+}
+
 /// Converts a VideoFrame directly into a Nisaba Pixmap surface.
 inline std::optional<nisaba::Pixmap> to_pixmap(const VideoFrame& frame) {
     if (!frame.is_valid()) return std::nullopt;
@@ -53,66 +152,11 @@ inline std::optional<nisaba::Pixmap> to_pixmap(const VideoFrame& frame) {
     if (!pixmap) return std::nullopt;
 
     auto mut = pixmap->as_mut();
-
-    if (frame.pixel_format() == PixelFormat::RGBA32) {
-        for (uint32_t y = 0; y < frame.height(); ++y) {
-            const uint8_t* src_row = frame.plane(0) + y * frame.stride(0);
-            uint8_t* dst_row = reinterpret_cast<uint8_t*>(mut.row(y));
-            std::memcpy(dst_row, src_row, frame.width() * 4);
-        }
-    } else if (frame.pixel_format() == PixelFormat::YUV420P) {
-        ColorConverter::yuv420p_to_rgba(
-            frame.plane(0), frame.stride(0),
-            frame.plane(1), frame.stride(1),
-            frame.plane(2), frame.stride(2),
-            mut.data_mut(), mut.stride_bytes(),
-            frame.width(), frame.height(),
-            frame.color_space(), frame.color_range()
-        );
-    } else if (frame.pixel_format() == PixelFormat::NV12) {
-        ColorConverter::nv12_to_rgba(
-            frame.plane(0), frame.stride(0),
-            frame.plane(1), frame.stride(1),
-            mut.data_mut(), mut.stride_bytes(),
-            frame.width(), frame.height(),
-            frame.color_space(), frame.color_range()
-        );
+    if (!blit_to_pixmap(frame, mut)) {
+        return std::nullopt;
     }
 
     return pixmap;
-}
-
-/// Directly blits a VideoFrame into an existing Nisaba mutable Pixmap surface without heap allocation.
-inline bool blit_to_pixmap(const VideoFrame& frame, nisaba::PixmapMut& target) {
-    if (!frame.is_valid() || target.width() < frame.width() || target.height() < frame.height()) {
-        return false;
-    }
-
-    if (frame.pixel_format() == PixelFormat::RGBA32) {
-        for (uint32_t y = 0; y < frame.height(); ++y) {
-            const uint8_t* src_row = frame.plane(0) + y * frame.stride(0);
-            uint8_t* dst_row = reinterpret_cast<uint8_t*>(target.row(y));
-            std::memcpy(dst_row, src_row, frame.width() * 4);
-        }
-    } else if (frame.pixel_format() == PixelFormat::YUV420P) {
-        ColorConverter::yuv420p_to_rgba(
-            frame.plane(0), frame.stride(0),
-            frame.plane(1), frame.stride(1),
-            frame.plane(2), frame.stride(2),
-            target.data_mut(), target.stride_bytes(),
-            frame.width(), frame.height(),
-            frame.color_space(), frame.color_range()
-        );
-    } else if (frame.pixel_format() == PixelFormat::NV12) {
-        ColorConverter::nv12_to_rgba(
-            frame.plane(0), frame.stride(0),
-            frame.plane(1), frame.stride(1),
-            target.data_mut(), target.stride_bytes(),
-            frame.width(), frame.height(),
-            frame.color_space(), frame.color_range()
-        );
-    }
-    return true;
 }
 
 /// Renders a decoded VideoFrame directly onto a Nisaba Canvas at the given coordinates.

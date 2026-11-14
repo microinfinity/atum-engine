@@ -115,6 +115,7 @@ MediaResult<HevcSps> HevcSps::parse(BitReader& reader) noexcept {
         auto dpb = reader.read_ue(); if (!dpb) return dpb.error();
         sps.sps_max_dec_pic_buffering_minus1 = *dpb;
         auto reord = reader.read_ue(); if (!reord) return reord.error();
+        sps.sps_max_num_reorder_pics = *reord;
         auto lat = reader.read_ue(); if (!lat) return lat.error();
     }
 

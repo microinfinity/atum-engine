@@ -1,5 +1,9 @@
 #include "atum/container/isobmff_demuxer.hpp"
 #include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <limits>
+#include <numeric>
 #include <unordered_set>
 
 namespace atum {
@@ -58,13 +62,48 @@ MediaResult<void> IsoBmffDemuxer::open(std::shared_ptr<IoReader> reader) {
         return MediaError::InvalidData;
     }
 
-    // Interleave all samples across all tracks ordered by byte offset
-    for (size_t t = 0; t < tracks_.size(); ++t) {
-        streams_.push_back(tracks_[t].stream);
-        if (!is_fragmented_) {
-            for (auto& s : tracks_[t].samples) {
-                interleaved_samples_.push_back(s);
+    // Compute stream metadata (nb_frames, exact framerate) and interleave samples across tracks
+    size_t total_samples = 0;
+    for (auto& trk : tracks_) {
+        trk.stream.nb_frames = static_cast<int64_t>(trk.samples.size());
+        if (trk.stream.codec_params.is_video() && !trk.samples.empty() &&
+            trk.timescale > 0 && trk.last_dts > 0) {
+            int64_t num = static_cast<int64_t>(trk.timescale) * static_cast<int64_t>(trk.samples.size());
+            int64_t den = trk.last_dts;
+            int64_t g = std::gcd(num, den);
+            if (g > 0) {
+                num /= g;
+                den /= g;
             }
+            constexpr int64_t kMaxInt32 = std::numeric_limits<int32_t>::max();
+            if (num > kMaxInt32 || den > kMaxInt32) {
+                const double fps = static_cast<double>(num) / static_cast<double>(den);
+                num = std::llround(fps * 1000.0);
+                den = 1000;
+                const int64_t g2 = std::gcd(num, den);
+                if (g2 > 0) {
+                    num /= g2;
+                    den /= g2;
+                }
+            }
+            if (num > 0 && den > 0 && num <= kMaxInt32 && den <= kMaxInt32) {
+                trk.stream.codec_params.framerate = Rational{static_cast<int32_t>(num), static_cast<int32_t>(den)};
+            }
+        }
+        streams_.push_back(trk.stream);
+        if (!is_fragmented_) {
+            total_samples += trk.samples.size();
+        }
+    }
+
+    if (!is_fragmented_) {
+        interleaved_samples_.reserve(total_samples);
+        for (auto& trk : tracks_) {
+            interleaved_samples_.insert(
+                interleaved_samples_.end(),
+                std::make_move_iterator(trk.samples.begin()),
+                std::make_move_iterator(trk.samples.end())
+            );
         }
     }
 
@@ -567,8 +606,17 @@ MediaResult<void> IsoBmffDemuxer::parse_stbl(TrackContext& ctx, int64_t box_star
     // Reconstruct samples
     if (chunk_offsets.empty() || stsc_entries.empty()) return MediaResult<void>::ok();
 
+    if (!sample_sizes.empty()) {
+        ctx.samples.reserve(ctx.samples.size() + sample_sizes.size());
+    } else if (!stts_entries.empty()) {
+        size_t total_stts = 0;
+        for (const auto& e : stts_entries) total_stts += e.count;
+        ctx.samples.reserve(ctx.samples.size() + total_stts);
+    }
+
     size_t sample_idx = 0;
     int64_t current_dts = 0;
+    size_t stsc_idx = 0;
     size_t stts_idx = 0;
     uint32_t stts_count_left = !stts_entries.empty() ? stts_entries[0].count : 0;
 
@@ -576,16 +624,16 @@ MediaResult<void> IsoBmffDemuxer::parse_stbl(TrackContext& ctx, int64_t box_star
     uint32_t ctts_count_left = !ctts_entries.empty() ? ctts_entries[0].count : 0;
 
     for (size_t chunk_idx = 0; chunk_idx < chunk_offsets.size(); ++chunk_idx) {
-        uint32_t chunk_num = static_cast<uint32_t>(chunk_idx + 1);
+        const uint32_t chunk_num = static_cast<uint32_t>(chunk_idx + 1);
 
-        uint32_t samples_per_chunk = 1;
-        for (const auto& entry : stsc_entries) {
-            if (chunk_num >= entry.first_chunk) {
-                samples_per_chunk = entry.samples_per_chunk;
-            } else {
-                break;
-            }
+        while (stsc_idx + 1 < stsc_entries.size() &&
+               chunk_num >= stsc_entries[stsc_idx + 1].first_chunk) {
+            ++stsc_idx;
         }
+        const uint32_t samples_per_chunk =
+            (chunk_num >= stsc_entries[stsc_idx].first_chunk && stsc_entries[stsc_idx].samples_per_chunk > 0)
+                ? stsc_entries[stsc_idx].samples_per_chunk
+                : 1;
 
         uint64_t cur_offset = chunk_offsets[chunk_idx];
 
@@ -865,16 +913,21 @@ MediaResult<void> IsoBmffDemuxer::read_packet(Packet& packet) {
     }
 
     const auto& rec = interleaved_samples_[current_sample_idx_++];
-    auto s_res = reader_->seek(rec.offset, SeekOrigin::Begin);
-    if (!s_res.is_ok()) return s_res.error();
+    if (reader_->tell() != static_cast<int64_t>(rec.offset)) {
+        auto s_res = reader_->seek(rec.offset, SeekOrigin::Begin);
+        if (!s_res.is_ok()) return s_res.error();
+    }
 
-    std::vector<uint8_t> buf(rec.size);
-    auto r_res = reader_->read_exact(buf.data(), rec.size);
-    if (!r_res.is_ok()) return r_res;
+    packet.clear();
+    packet.resize(rec.size);
+    if (rec.size > 0) {
+        auto r_res = reader_->read_exact(packet.data_mut(), rec.size);
+        if (!r_res.is_ok()) return r_res;
+    }
 
-    packet = Packet::from_bytes(buf);
     packet.set_pts(rec.pts);
     packet.set_dts(rec.dts);
+    packet.set_duration(rec.duration);
     packet.set_stream_index(rec.stream_index);
     packet.set_keyframe(rec.is_keyframe);
 

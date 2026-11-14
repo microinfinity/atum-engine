@@ -11,7 +11,7 @@ namespace atum::gl {
 
 EglContext::Scope::Scope(const EglContext& ctx) noexcept
     : ctx_(ctx) {
-    if (!ctx_.is_valid()) {
+    if (!ctx_.is_valid() || ctx_.is_current()) {
         return;
     }
     const auto& disp = ctx_.dispatcher();
@@ -61,6 +61,7 @@ EglContext& EglContext::operator=(EglContext&& other) noexcept {
         config_ = other.config_;
         context_ = other.context_;
         surface_ = other.surface_;
+        owns_resources_ = other.owns_resources_;
         major_version_ = other.major_version_;
         minor_version_ = other.minor_version_;
         gl_vendor_ = std::move(other.gl_vendor_);
@@ -72,6 +73,7 @@ EglContext& EglContext::operator=(EglContext&& other) noexcept {
         other.config_ = nullptr;
         other.context_ = EGL_NO_CONTEXT_PTR;
         other.surface_ = EGL_NO_SURFACE_PTR;
+        other.owns_resources_ = true;
         other.major_version_ = 0;
         other.minor_version_ = 0;
     }
@@ -80,34 +82,82 @@ EglContext& EglContext::operator=(EglContext&& other) noexcept {
 
 void EglContext::reset() noexcept {
     if (!dispatcher_) {
+        surface_ = EGL_NO_SURFACE_PTR;
+        context_ = EGL_NO_CONTEXT_PTR;
+        display_ = EGL_NO_DISPLAY_PTR;
+        owns_resources_ = true;
         return;
     }
 
-    if (is_current()) {
-        release_current();
+    if (owns_resources_) {
+        if (is_current()) {
+            release_current();
+        }
+
+        if (display_ != EGL_NO_DISPLAY_PTR) {
+            if (surface_ != EGL_NO_SURFACE_PTR && dispatcher_->eglDestroySurface) {
+                dispatcher_->eglDestroySurface(display_, surface_);
+            }
+            if (context_ != EGL_NO_CONTEXT_PTR && dispatcher_->eglDestroyContext) {
+                dispatcher_->eglDestroyContext(display_, context_);
+            }
+            if (dispatcher_->eglTerminate) {
+                dispatcher_->eglTerminate(display_);
+            }
+        }
     }
 
-    if (display_ != EGL_NO_DISPLAY_PTR) {
-        if (surface_ != EGL_NO_SURFACE_PTR && dispatcher_->eglDestroySurface) {
-            dispatcher_->eglDestroySurface(display_, surface_);
-            surface_ = EGL_NO_SURFACE_PTR;
-        }
-        if (context_ != EGL_NO_CONTEXT_PTR && dispatcher_->eglDestroyContext) {
-            dispatcher_->eglDestroyContext(display_, context_);
-            context_ = EGL_NO_CONTEXT_PTR;
-        }
-        if (dispatcher_->eglTerminate) {
-            dispatcher_->eglTerminate(display_);
-            display_ = EGL_NO_DISPLAY_PTR;
-        }
-    }
-
+    surface_ = EGL_NO_SURFACE_PTR;
+    context_ = EGL_NO_CONTEXT_PTR;
+    display_ = EGL_NO_DISPLAY_PTR;
+    owns_resources_ = true;
     config_ = nullptr;
     major_version_ = 0;
     minor_version_ = 0;
     gl_vendor_.clear();
     gl_renderer_.clear();
     gl_version_.clear();
+}
+
+MediaResult<std::unique_ptr<EglContext>> EglContext::wrap_external(
+    GlDispatcher& dispatcher,
+    EGLDisplay display,
+    EGLContext context,
+    EGLSurface draw_surface
+) {
+    if (display == EGL_NO_DISPLAY_PTR || context == EGL_NO_CONTEXT_PTR) {
+        return MediaError::InvalidData;
+    }
+    if (!dispatcher.load_egl()) {
+        return MediaError::HardwareError;
+    }
+
+    if (draw_surface == EGL_NO_SURFACE_PTR && dispatcher.eglGetCurrentContext &&
+        dispatcher.eglGetCurrentSurface && dispatcher.eglGetCurrentContext() == context) {
+        draw_surface = dispatcher.eglGetCurrentSurface(EGL_DRAW);
+    }
+
+    auto ctx = std::unique_ptr<EglContext>(new EglContext(dispatcher));
+    ctx->display_ = display;
+    ctx->context_ = context;
+    ctx->surface_ = draw_surface;
+    ctx->owns_resources_ = false;
+
+    Scope scope(*ctx);
+    if (!dispatcher.load_gl(display)) {
+        return MediaError::HardwareError;
+    }
+
+    if (ctx->is_current() && dispatcher.glGetString) {
+        const auto* vendor = reinterpret_cast<const char*>(dispatcher.glGetString(0x1F00));
+        const auto* renderer = reinterpret_cast<const char*>(dispatcher.glGetString(0x1F01));
+        const auto* version = reinterpret_cast<const char*>(dispatcher.glGetString(0x1F02));
+        if (vendor) ctx->gl_vendor_ = vendor;
+        if (renderer) ctx->gl_renderer_ = renderer;
+        if (version) ctx->gl_version_ = version;
+    }
+
+    return ctx;
 }
 
 MediaResult<std::unique_ptr<EglContext>> EglContext::create_headless(GlDispatcher& dispatcher) {

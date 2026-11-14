@@ -2,13 +2,185 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#endif
 
 namespace atum {
+
+namespace {
+
+struct YuvToRgbCoeffs {
+    int32_t y_bias;
+    int32_t c_y;
+    int32_t r_v;
+    int32_t g_u;
+    int32_t g_v;
+    int32_t b_u;
+};
+
+constexpr YuvToRgbCoeffs get_yuv_coeffs(ColorSpace space, ColorRange range) noexcept {
+    if (range == ColorRange::Studio) {
+        if (space == ColorSpace::BT709) {
+            return {16, 298, 459, -55, -136, 541};
+        }
+        if (space == ColorSpace::BT2020) {
+            return {16, 298, 430, -48, -166, 548};
+        }
+        return {16, 298, 409, -100, -208, 516};
+    }
+    if (space == ColorSpace::BT709) {
+        return {0, 256, 403, -48, -120, 475};
+    }
+    if (space == ColorSpace::BT2020) {
+        return {0, 256, 377, -42, -146, 481};
+    }
+    return {0, 256, 359, -88, -183, 454};
+}
+
+} // namespace
 
 static inline uint8_t clamp_u8(int32_t val) noexcept {
     if (val < 0) return 0;
     if (val > 255) return 255;
     return static_cast<uint8_t>(val);
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+template <bool IsNv12>
+__attribute__((target("avx2")))
+static void yuv420_to_rgba_avx2_impl(
+    const uint8_t* y_plane, size_t y_stride,
+    const uint8_t* c0_plane, size_t c0_stride,
+    const uint8_t* c1_plane, size_t c1_stride,
+    uint8_t* dst_rgba, size_t dst_stride,
+    uint32_t width, uint32_t height,
+    YuvToRgbCoeffs c
+) noexcept {
+    const __m256i v_ybias = _mm256_set1_epi32(c.y_bias);
+    const __m256i v_128   = _mm256_set1_epi32(128);
+    const __m256i v_cy    = _mm256_set1_epi32(c.c_y);
+    const __m256i v_rv    = _mm256_set1_epi32(c.r_v);
+    const __m256i v_gu    = _mm256_set1_epi32(c.g_u);
+    const __m256i v_gv    = _mm256_set1_epi32(c.g_v);
+    const __m256i v_bu    = _mm256_set1_epi32(c.b_u);
+    const __m256i v_zero  = _mm256_setzero_si256();
+    const __m256i v_255   = _mm256_set1_epi32(255);
+    const __m256i v_alpha = _mm256_set1_epi32(static_cast<int32_t>(0xFF000000u));
+
+    const __m128i nv12_shuf_u = _mm_setr_epi8(0, 0, 2, 2, 4, 4, 6, 6, -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i nv12_shuf_v = _mm_setr_epi8(1, 1, 3, 3, 5, 5, 7, 7, -1, -1, -1, -1, -1, -1, -1, -1);
+
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* py = y_plane + y * y_stride;
+        const uint8_t* pc0 = c0_plane + (y >> 1) * c0_stride;
+        const uint8_t* pc1 = IsNv12 ? nullptr : (c1_plane + (y >> 1) * c1_stride);
+        uint8_t* pdst = dst_rgba + y * dst_stride;
+
+        uint32_t x = 0;
+        for (; x + 8 <= width; x += 8) {
+            const __m128i y_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(py + x));
+            const __m256i y32 = _mm256_sub_epi32(_mm256_cvtepu8_epi32(y_bytes), v_ybias);
+            const __m256i y_scaled = _mm256_add_epi32(_mm256_mullo_epi32(y32, v_cy), v_128);
+
+            __m128i u_dup{};
+            __m128i v_dup{};
+            if constexpr (IsNv12) {
+                const __m128i uv_bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pc0 + x));
+                u_dup = _mm_shuffle_epi8(uv_bytes, nv12_shuf_u);
+                v_dup = _mm_shuffle_epi8(uv_bytes, nv12_shuf_v);
+            } else {
+                const uint32_t u32 = *reinterpret_cast<const uint32_t*>(pc0 + (x >> 1));
+                const uint32_t v32 = *reinterpret_cast<const uint32_t*>(pc1 + (x >> 1));
+                const __m128i u_raw = _mm_cvtsi32_si128(static_cast<int>(u32));
+                const __m128i v_raw = _mm_cvtsi32_si128(static_cast<int>(v32));
+                u_dup = _mm_unpacklo_epi8(u_raw, u_raw);
+                v_dup = _mm_unpacklo_epi8(v_raw, v_raw);
+            }
+
+            const __m256i d32 = _mm256_sub_epi32(_mm256_cvtepu8_epi32(u_dup), v_128);
+            const __m256i e32 = _mm256_sub_epi32(_mm256_cvtepu8_epi32(v_dup), v_128);
+
+            __m256i r32 = _mm256_srai_epi32(_mm256_add_epi32(y_scaled, _mm256_mullo_epi32(e32, v_rv)), 8);
+            __m256i g32 = _mm256_srai_epi32(
+                _mm256_add_epi32(
+                    y_scaled,
+                    _mm256_add_epi32(_mm256_mullo_epi32(d32, v_gu), _mm256_mullo_epi32(e32, v_gv))
+                ),
+                8
+            );
+            __m256i b32 = _mm256_srai_epi32(_mm256_add_epi32(y_scaled, _mm256_mullo_epi32(d32, v_bu)), 8);
+
+            r32 = _mm256_min_epi32(v_255, _mm256_max_epi32(v_zero, r32));
+            g32 = _mm256_min_epi32(v_255, _mm256_max_epi32(v_zero, g32));
+            b32 = _mm256_min_epi32(v_255, _mm256_max_epi32(v_zero, b32));
+
+            const __m256i rgba = _mm256_or_si256(
+                _mm256_or_si256(r32, _mm256_slli_epi32(g32, 8)),
+                _mm256_or_si256(_mm256_slli_epi32(b32, 16), v_alpha)
+            );
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(pdst + x * 4), rgba);
+        }
+
+        for (; x < width; ++x) {
+            const int32_t ch = static_cast<int32_t>(py[x]) - c.y_bias;
+            const int32_t d = static_cast<int32_t>(IsNv12 ? pc0[(x & ~1u)] : pc0[x >> 1]) - 128;
+            const int32_t e = static_cast<int32_t>(IsNv12 ? pc0[(x & ~1u) + 1] : pc1[x >> 1]) - 128;
+            const int32_t y_term = c.c_y * ch + 128;
+            pdst[x * 4 + 0] = clamp_u8((y_term + c.r_v * e) >> 8);
+            pdst[x * 4 + 1] = clamp_u8((y_term + c.g_u * d + c.g_v * e) >> 8);
+            pdst[x * 4 + 2] = clamp_u8((y_term + c.b_u * d) >> 8);
+            pdst[x * 4 + 3] = 255;
+        }
+    }
+}
+#endif
+
+template <bool IsNv12>
+static void yuv420_to_rgba_scalar_fast(
+    const uint8_t* y_plane, size_t y_stride,
+    const uint8_t* c0_plane, size_t c0_stride,
+    const uint8_t* c1_plane, size_t c1_stride,
+    uint8_t* dst_rgba, size_t dst_stride,
+    uint32_t width, uint32_t height,
+    YuvToRgbCoeffs c
+) noexcept {
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* py = y_plane + y * y_stride;
+        const uint8_t* pc0 = c0_plane + (y >> 1) * c0_stride;
+        const uint8_t* pc1 = IsNv12 ? nullptr : (c1_plane + (y >> 1) * c1_stride);
+        uint8_t* pdst = dst_rgba + y * dst_stride;
+
+        uint32_t x = 0;
+        for (; x + 1 < width; x += 2) {
+            const int32_t d = static_cast<int32_t>(IsNv12 ? pc0[x] : pc0[x >> 1]) - 128;
+            const int32_t e = static_cast<int32_t>(IsNv12 ? pc0[x + 1] : pc1[x >> 1]) - 128;
+            const int32_t rv = c.r_v * e + 128;
+            const int32_t guv = c.g_u * d + c.g_v * e + 128;
+            const int32_t bu = c.b_u * d + 128;
+
+            const int32_t y0 = c.c_y * (static_cast<int32_t>(py[x]) - c.y_bias);
+            pdst[x * 4 + 0] = clamp_u8((y0 + rv) >> 8);
+            pdst[x * 4 + 1] = clamp_u8((y0 + guv) >> 8);
+            pdst[x * 4 + 2] = clamp_u8((y0 + bu) >> 8);
+            pdst[x * 4 + 3] = 255;
+
+            const int32_t y1 = c.c_y * (static_cast<int32_t>(py[x + 1]) - c.y_bias);
+            pdst[(x + 1) * 4 + 0] = clamp_u8((y1 + rv) >> 8);
+            pdst[(x + 1) * 4 + 1] = clamp_u8((y1 + guv) >> 8);
+            pdst[(x + 1) * 4 + 2] = clamp_u8((y1 + bu) >> 8);
+            pdst[(x + 1) * 4 + 3] = 255;
+        }
+        if (x < width) {
+            const int32_t d = static_cast<int32_t>(IsNv12 ? pc0[x] : pc0[x >> 1]) - 128;
+            const int32_t e = static_cast<int32_t>(IsNv12 ? pc0[x + 1] : pc1[x >> 1]) - 128;
+            const int32_t y0 = c.c_y * (static_cast<int32_t>(py[x]) - c.y_bias) + 128;
+            pdst[x * 4 + 0] = clamp_u8((y0 + c.r_v * e) >> 8);
+            pdst[x * 4 + 1] = clamp_u8((y0 + c.g_u * d + c.g_v * e) >> 8);
+            pdst[x * 4 + 2] = clamp_u8((y0 + c.b_u * d) >> 8);
+            pdst[x * 4 + 3] = 255;
+        }
+    }
 }
 
 static inline uint8_t clamp_f_to_u8(float val) noexcept {
@@ -30,65 +202,21 @@ void ColorConverter::yuv420p_to_rgba(
     ColorSpace space,
     ColorRange range
 ) noexcept {
-    if (!y_plane || !u_plane || !v_plane || !dst_rgba) return;
-
-    for (uint32_t y = 0; y < height; ++y) {
-        const uint8_t* py = y_plane + y * y_stride;
-        const uint8_t* pu = u_plane + (y / 2) * u_stride;
-        const uint8_t* pv = v_plane + (y / 2) * v_stride;
-        uint8_t* pdst = dst_rgba + y * dst_stride;
-
-        for (uint32_t x = 0; x < width; ++x) {
-            uint8_t Y = py[x];
-            uint8_t U = pu[x / 2];
-            uint8_t V = pv[x / 2];
-
-            int32_t r = 0, g = 0, b = 0;
-
-            if (range == ColorRange::Studio) {
-                int32_t c = static_cast<int32_t>(Y) - 16;
-                int32_t d = static_cast<int32_t>(U) - 128;
-                int32_t e = static_cast<int32_t>(V) - 128;
-
-                if (space == ColorSpace::BT709) {
-                    r = (298 * c + 459 * e + 128) >> 8;
-                    g = (298 * c - 55 * d - 136 * e + 128) >> 8;
-                    b = (298 * c + 541 * d + 128) >> 8;
-                } else if (space == ColorSpace::BT2020) {
-                    r = (298 * c + 430 * e + 128) >> 8;
-                    g = (298 * c - 48 * d - 166 * e + 128) >> 8;
-                    b = (298 * c + 548 * d + 128) >> 8;
-                } else { // BT.601
-                    r = (298 * c + 409 * e + 128) >> 8;
-                    g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-                    b = (298 * c + 516 * d + 128) >> 8;
-                }
-            } else { // Full Range
-                int32_t c = static_cast<int32_t>(Y);
-                int32_t d = static_cast<int32_t>(U) - 128;
-                int32_t e = static_cast<int32_t>(V) - 128;
-
-                if (space == ColorSpace::BT709) {
-                    r = c + ((403 * e + 128) >> 8);
-                    g = c - ((48 * d + 120 * e + 128) >> 8);
-                    b = c + ((475 * d + 128) >> 8);
-                } else if (space == ColorSpace::BT2020) {
-                    r = c + ((377 * e + 128) >> 8);
-                    g = c - ((42 * d + 146 * e + 128) >> 8);
-                    b = c + ((481 * d + 128) >> 8);
-                } else { // BT.601
-                    r = c + ((359 * e + 128) >> 8);
-                    g = c - ((88 * d + 183 * e + 128) >> 8);
-                    b = c + ((454 * d + 128) >> 8);
-                }
-            }
-
-            pdst[x * 4 + 0] = clamp_u8(r);
-            pdst[x * 4 + 1] = clamp_u8(g);
-            pdst[x * 4 + 2] = clamp_u8(b);
-            pdst[x * 4 + 3] = 255;
-        }
+    if (!y_plane || !u_plane || !v_plane || !dst_rgba || width == 0 || height == 0) return;
+    const YuvToRgbCoeffs coeffs = get_yuv_coeffs(space, range);
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx2")) {
+        yuv420_to_rgba_avx2_impl<false>(
+            y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
+            dst_rgba, dst_stride, width, height, coeffs
+        );
+        return;
     }
+#endif
+    yuv420_to_rgba_scalar_fast<false>(
+        y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
+        dst_rgba, dst_stride, width, height, coeffs
+    );
 }
 
 void ColorConverter::yuv422p_to_rgba(
@@ -223,57 +351,21 @@ void ColorConverter::nv12_to_rgba(
     ColorSpace space,
     ColorRange range
 ) noexcept {
-    if (!y_plane || !uv_plane || !dst_rgba) return;
-
-    for (uint32_t y = 0; y < height; ++y) {
-        const uint8_t* py = y_plane + y * y_stride;
-        const uint8_t* puv = uv_plane + (y / 2) * uv_stride;
-        uint8_t* pdst = dst_rgba + y * dst_stride;
-
-        for (uint32_t x = 0; x < width; ++x) {
-            uint8_t Y = py[x];
-            uint32_t uv_idx = (x / 2) * 2;
-            uint8_t U = puv[uv_idx + 0];
-            uint8_t V = puv[uv_idx + 1];
-
-            int32_t r = 0, g = 0, b = 0;
-
-            if (range == ColorRange::Studio) {
-                int32_t c = static_cast<int32_t>(Y) - 16;
-                int32_t d = static_cast<int32_t>(U) - 128;
-                int32_t e = static_cast<int32_t>(V) - 128;
-
-                if (space == ColorSpace::BT709) {
-                    r = (298 * c + 459 * e + 128) >> 8;
-                    g = (298 * c - 55 * d - 136 * e + 128) >> 8;
-                    b = (298 * c + 541 * d + 128) >> 8;
-                } else {
-                    r = (298 * c + 409 * e + 128) >> 8;
-                    g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-                    b = (298 * c + 516 * d + 128) >> 8;
-                }
-            } else {
-                int32_t c = static_cast<int32_t>(Y);
-                int32_t d = static_cast<int32_t>(U) - 128;
-                int32_t e = static_cast<int32_t>(V) - 128;
-
-                if (space == ColorSpace::BT709) {
-                    r = c + ((403 * e + 128) >> 8);
-                    g = c - ((48 * d + 120 * e + 128) >> 8);
-                    b = c + ((475 * d + 128) >> 8);
-                } else {
-                    r = c + ((359 * e + 128) >> 8);
-                    g = c - ((88 * d + 183 * e + 128) >> 8);
-                    b = c + ((454 * d + 128) >> 8);
-                }
-            }
-
-            pdst[x * 4 + 0] = clamp_u8(r);
-            pdst[x * 4 + 1] = clamp_u8(g);
-            pdst[x * 4 + 2] = clamp_u8(b);
-            pdst[x * 4 + 3] = 255;
-        }
+    if (!y_plane || !uv_plane || !dst_rgba || width == 0 || height == 0) return;
+    const YuvToRgbCoeffs coeffs = get_yuv_coeffs(space, range);
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx2")) {
+        yuv420_to_rgba_avx2_impl<true>(
+            y_plane, y_stride, uv_plane, uv_stride, nullptr, 0,
+            dst_rgba, dst_stride, width, height, coeffs
+        );
+        return;
     }
+#endif
+    yuv420_to_rgba_scalar_fast<true>(
+        y_plane, y_stride, uv_plane, uv_stride, nullptr, 0,
+        dst_rgba, dst_stride, width, height, coeffs
+    );
 }
 
 void ColorConverter::rgba_to_yuv420p(

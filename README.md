@@ -3,9 +3,6 @@
 > **Sovereign, Exclusively Hardware-Accelerated Multimedia Processing Engine**  
 > *Engineered in pure C++20 for high-performance zero-copy hardware video decoding & encoding (VA-API / DRM DMA-BUF), direct Vulkan & OpenGL GPU interop, sovereign audio decoding, container multiplexing, HDR color science, and multicore DAG scheduling.*
 
-> [!WARNING]
-> **Active Development / Experimental Status**: This project is under **active development (Work in Progress)**, remains in an **experimental stage**, and is **incomplete**. APIs, data structures, and architectural interfaces are subject to ongoing refinements and breaking changes.
-
 ---
 
 ## 1. Overview & Current Status

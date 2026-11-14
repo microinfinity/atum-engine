@@ -82,6 +82,11 @@ inline constexpr EGLint EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT_VAL = 0x3445;
 inline constexpr EGLint EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT_VAL = 0x3446;
 inline constexpr EGLint EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT_VAL = 0x3447;
 inline constexpr EGLint EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT_VAL = 0x3448;
+inline constexpr EGLint EGL_DMA_BUF_PLANE3_FD_EXT_VAL = 0x3440;
+inline constexpr EGLint EGL_DMA_BUF_PLANE3_OFFSET_EXT_VAL = 0x3441;
+inline constexpr EGLint EGL_DMA_BUF_PLANE3_PITCH_EXT_VAL = 0x3442;
+inline constexpr EGLint EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT_VAL = 0x3449;
+inline constexpr EGLint EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT_VAL = 0x344A;
 inline constexpr EGLint EGL_IMAGE_PRESERVED_KHR_VAL = 0x30D2;
 inline constexpr EGLenum EGL_GL_TEXTURE_2D_KHR_VAL = 0x30B1;
 
@@ -168,7 +173,16 @@ inline constexpr GLbitfield GL_COLOR_BUFFER_BIT_VAL = 0x00004000;
 inline constexpr GLenum GL_VIEWPORT_VAL = 0x0BA2;
 inline constexpr GLenum GL_NO_ERROR_VAL = 0;
 
+inline constexpr GLenum GL_TEXTURE0_VAL = 0x84C0;
+inline constexpr GLenum GL_TEXTURE1_VAL = 0x84C1;
+inline constexpr GLenum GL_TEXTURE2_VAL = 0x84C2;
+
 // DRM FourCC Definitions
+inline constexpr uint32_t DRM_FOURCC_R8       = 0x20203852;
+inline constexpr uint32_t DRM_FOURCC_R16      = 0x20363152;
+inline constexpr uint32_t DRM_FOURCC_RG88     = 0x38384752;
+inline constexpr uint32_t DRM_FOURCC_GR88     = 0x38385247;
+inline constexpr uint32_t DRM_FOURCC_GR1616   = 0x32335247;
 inline constexpr uint32_t DRM_FOURCC_ARGB8888 = 0x34325241;
 inline constexpr uint32_t DRM_FOURCC_XRGB8888 = 0x34325258;
 inline constexpr uint32_t DRM_FOURCC_ABGR8888 = 0x34324241;

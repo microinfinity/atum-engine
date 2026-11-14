@@ -221,6 +221,37 @@ MediaResult<H264Sps> H264Sps::parse(BitReader& reader) noexcept {
             auto scale = reader.read_bits(32); if (!scale) return scale.error(); sps.vui.time_scale = *scale;
             auto fixed_fps = reader.read_bit(); if (!fixed_fps) return fixed_fps.error(); sps.vui.fixed_frame_rate_flag = (*fixed_fps != 0);
         }
+
+        auto skip_hrd = [&reader]() -> bool {
+            auto cpb_cnt = reader.read_ue(); if (!cpb_cnt) return false;
+            if (!reader.skip_bits(8)) return false; // bit_rate_scale, cpb_size_scale
+            for (uint32_t i = 0; i <= *cpb_cnt; ++i) {
+                if (!reader.read_ue() || !reader.read_ue() || !reader.read_bit()) return false;
+            }
+            if (!reader.skip_bits(20)) return false; // 4 x 5-bit lengths
+            return true;
+        };
+
+        if (auto nal_hrd = reader.read_bit()) {
+            bool any_hrd = (*nal_hrd != 0);
+            if (*nal_hrd != 0 && !skip_hrd()) return sps;
+            auto vcl_hrd = reader.read_bit();
+            if (!vcl_hrd) return sps;
+            if (*vcl_hrd != 0) {
+                any_hrd = true;
+                if (!skip_hrd()) return sps;
+            }
+            if (any_hrd && !reader.read_bit()) return sps; // low_delay_hrd_flag
+            if (!reader.read_bit()) return sps; // pic_struct_present_flag
+            auto bsr = reader.read_bit();
+            if (bsr && *bsr != 0) {
+                sps.vui.bitstream_restriction_flag = true;
+                if (!reader.read_bit()) return sps; // motion_vectors_over_pic_boundaries_flag
+                if (!reader.read_ue() || !reader.read_ue() || !reader.read_ue() || !reader.read_ue()) return sps;
+                auto reord = reader.read_ue(); if (!reord) return sps; sps.vui.max_num_reorder_frames = *reord;
+                auto dec_buf = reader.read_ue(); if (!dec_buf) return sps; sps.vui.max_dec_frame_buffering = *dec_buf;
+            }
+        }
     }
 
     return sps;

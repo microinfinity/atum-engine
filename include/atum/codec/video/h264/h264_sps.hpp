@@ -35,6 +35,10 @@ struct H264VuiParameters {
     uint32_t num_units_in_tick{0};
     uint32_t time_scale{0};
     bool fixed_frame_rate_flag{false};
+
+    bool bitstream_restriction_flag{false};
+    uint32_t max_num_reorder_frames{0};
+    uint32_t max_dec_frame_buffering{0};
 };
 
 /// H.264 Sequence Parameter Set (SPS).

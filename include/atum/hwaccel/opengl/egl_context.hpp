@@ -44,6 +44,14 @@ public:
     /// Creates a headless, off-screen EGL context for server-side decoding and zero-copy DMA-BUF interop.
     static MediaResult<std::unique_ptr<EglContext>> create_headless(GlDispatcher& dispatcher);
 
+    /// Wraps an externally-owned EGLDisplay / EGLContext (non-owning; reset() will not destroy external handles).
+    static MediaResult<std::unique_ptr<EglContext>> wrap_external(
+        GlDispatcher& dispatcher,
+        EGLDisplay display,
+        EGLContext context,
+        EGLSurface draw_surface = EGL_NO_SURFACE_PTR
+    );
+
     /// Activates this context on the calling thread.
     MediaResult<void> make_current() const noexcept;
 
@@ -71,6 +79,8 @@ public:
     [[nodiscard]] std::string_view gl_renderer() const noexcept { return gl_renderer_; }
     [[nodiscard]] std::string_view gl_version() const noexcept { return gl_version_; }
 
+    [[nodiscard]] bool owns_resources() const noexcept { return owns_resources_; }
+
     /// Releases all native EGL resources.
     void reset() noexcept;
 
@@ -80,6 +90,7 @@ private:
     EGLConfig config_{nullptr};
     EGLContext context_{EGL_NO_CONTEXT_PTR};
     EGLSurface surface_{EGL_NO_SURFACE_PTR};
+    bool owns_resources_{true};
 
     int major_version_{0};
     int minor_version_{0};

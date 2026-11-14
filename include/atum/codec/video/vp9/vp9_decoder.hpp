@@ -9,6 +9,7 @@
 #include "atum/codec/video/vp9/vp9_parser.hpp"
 #include "atum/predict/dpb.hpp"
 #include "atum/hwaccel/hwaccel.hpp"
+#include "atum/hwaccel/hw_surface_pool.hpp"
 
 namespace atum {
 
@@ -56,10 +57,10 @@ private:
     // Hardware Acceleration Pipeline State
     uint32_t hw_config_id_{0};
     uint32_t hw_context_id_{0};
-    std::vector<uint32_t> hw_surfaces_;
-    uint32_t current_surface_idx_{0};
+    HwSurfacePool surface_pool_;
     bool hw_pipeline_initialized_{false};
     std::array<uint32_t, 8> ref_surfaces_{0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+    std::array<VideoFrame, 8> ref_frames_;
     uint32_t last_width_{0};
     uint32_t last_height_{0};
 

@@ -114,11 +114,178 @@ struct VaSymbols {
 };
 
 static VaSymbols g_va_syms{};
+static std::mutex g_va_syms_mutex;
+
+class VaSurfaceBacking final : public HwFrameBacking {
+public:
+    VaSurfaceBacking(
+        VaapiDevice* device,
+        std::shared_ptr<VaDeviceLifetime> lifetime,
+        uint32_t surface_id,
+        uint32_t width,
+        uint32_t height,
+        PixelFormat format,
+        std::shared_ptr<void> surface_lease
+    )
+        : device_(device)
+        , lifetime_(std::move(lifetime))
+        , surface_id_(surface_id)
+        , width_(width)
+        , height_(height)
+        , format_(format)
+        , surface_lease_(std::move(surface_lease)) {}
+
+    ~VaSurfaceBacking() override {
+        for (size_t i = 0; i < dma_layout_.fds.size(); ++i) {
+            int fd = dma_layout_.fds[i];
+            if (fd < 0) continue;
+            bool duplicate = false;
+            for (size_t j = 0; j < i; ++j) {
+                if (dma_layout_.fds[j] == fd) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                ::close(fd);
+            }
+            dma_layout_.fds[i] = -1;
+        }
+    }
+
+    [[nodiscard]] uint32_t surface_id() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return surface_id_;
+    }
+
+    bool ensure_cpu_mapped(
+        PixelFormat& inout_format,
+        std::array<uint8_t*, 4>& out_planes,
+        std::array<size_t, 4>& out_strides
+    ) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ensure_cpu_mapped_locked(inout_format, out_planes, out_strides);
+    }
+
+    [[nodiscard]] const HwFrameBufferLayout* export_dma_buf(bool sync_first) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (dma_exported_) {
+            return &dma_layout_;
+        }
+        if (surface_id_ == 0xFFFFFFFF || !device_ || !lifetime_) {
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> dev_lock(lifetime_->mutex);
+        if (!lifetime_->alive) {
+            return nullptr;
+        }
+
+        if (sync_first && !synced_) {
+            if (device_->sync_surface(surface_id_).is_ok()) {
+                synced_ = true;
+            }
+        }
+
+        HwBufferDescriptor desc{};
+        if (!device_->export_surface_dma_buf(surface_id_, desc).is_ok()) {
+            return nullptr;
+        }
+
+        dma_layout_.width = desc.width;
+        dma_layout_.height = desc.height;
+        dma_layout_.drm_fourcc = desc.drm_fourcc;
+        dma_layout_.num_planes = desc.num_planes;
+        for (size_t i = 0; i < 4; ++i) {
+            dma_layout_.fds[i] = desc.fds[i];
+            dma_layout_.strides[i] = desc.strides[i];
+            dma_layout_.offsets[i] = desc.offsets[i];
+            dma_layout_.modifiers[i] = desc.modifiers[i];
+            dma_layout_.object_indices[i] = desc.object_indices[i];
+        }
+        dma_layout_.modifier = desc.modifier;
+
+        uint32_t obj_cnt = 0;
+        for (int32_t fd : desc.fds) {
+            if (fd >= 0) ++obj_cnt;
+        }
+        dma_layout_.num_objects = obj_cnt;
+        dma_exported_ = true;
+        return &dma_layout_;
+    }
+
+    [[nodiscard]] int32_t cached_dma_buf_fd() const noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return dma_exported_ ? dma_layout_.plane_fd(0) : -1;
+    }
+
+    void detach_surface_to_cpu() noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        PixelFormat fmt = format_;
+        std::array<uint8_t*, 4> planes{};
+        std::array<size_t, 4> strides{};
+        (void)ensure_cpu_mapped_locked(fmt, planes, strides);
+        surface_id_ = 0xFFFFFFFF;
+        surface_lease_.reset();
+    }
+
+private:
+    bool ensure_cpu_mapped_locked(
+        PixelFormat& inout_format,
+        std::array<uint8_t*, 4>& out_planes,
+        std::array<size_t, 4>& out_strides
+    ) noexcept {
+        if (!cpu_mapped_) {
+            if (surface_id_ == 0xFFFFFFFF || !device_ || !lifetime_) {
+                return false;
+            }
+            std::lock_guard<std::mutex> dev_lock(lifetime_->mutex);
+            if (!lifetime_->alive) {
+                return false;
+            }
+            if (!synced_) {
+                if (device_->sync_surface(surface_id_).is_ok()) {
+                    synced_ = true;
+                }
+            }
+            auto derived = device_->derive_surface_to_frame(surface_id_, width_, height_, format_);
+            if (!derived.is_ok() || !derived->is_valid()) {
+                return false;
+            }
+            cpu_frame_ = std::move(*derived);
+            cpu_mapped_ = true;
+        }
+
+        if (!cpu_frame_.is_valid()) return false;
+        inout_format = cpu_frame_.pixel_format();
+        for (size_t i = 0; i < 4; ++i) {
+            out_planes[i] = const_cast<uint8_t*>(cpu_frame_.plane(i));
+            out_strides[i] = cpu_frame_.stride(i);
+        }
+        return out_planes[0] != nullptr;
+    }
+
+    VaapiDevice* device_{nullptr};
+    std::shared_ptr<VaDeviceLifetime> lifetime_;
+    uint32_t surface_id_{0xFFFFFFFF};
+    uint32_t width_{0};
+    uint32_t height_{0};
+    PixelFormat format_{PixelFormat::NV12};
+    std::shared_ptr<void> surface_lease_;
+
+    mutable std::mutex mutex_;
+    bool synced_{false};
+    bool cpu_mapped_{false};
+    VideoFrame cpu_frame_;
+    bool dma_exported_{false};
+    HwFrameBufferLayout dma_layout_{};
+};
 
 } // anonymous namespace
 #endif
 
-VaapiDevice::VaapiDevice() {
+VaapiDevice::VaapiDevice()
+    : lifetime_(std::make_shared<VaDeviceLifetime>()) {
     init_internal();
 }
 
@@ -142,52 +309,64 @@ void VaapiDevice::init_internal() noexcept {
         return;
     }
 
-    if (!g_va_syms.load(libva_handle_, libva_drm_handle_)) {
-        return;
+    {
+        std::lock_guard<std::mutex> sym_lock(g_va_syms_mutex);
+        if (!g_va_syms.load(libva_handle_, libva_drm_handle_)) {
+            return;
+        }
     }
 
-    // 2. Open Linux DRM render node (/dev/dri/renderD128 .. renderD136)
+    // 2. Probe Linux DRM render nodes and validate VA-API initialization on each candidate
     const char* render_nodes[] = {
         "/dev/dri/renderD128",
         "/dev/dri/renderD129",
         "/dev/dri/renderD130",
-        "/dev/dri/card0"
+        "/dev/dri/renderD131",
+        "/dev/dri/renderD132",
+        "/dev/dri/renderD133",
+        "/dev/dri/renderD134",
+        "/dev/dri/renderD135",
+        "/dev/dri/card0",
+        "/dev/dri/card1"
     };
 
     for (const char* node : render_nodes) {
-        drm_fd_ = open(node, O_RDWR | O_CLOEXEC);
-        if (drm_fd_ >= 0) {
-            break;
+        int fd = open(node, O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+
+        VADisplay dpy = g_va_syms.vaGetDisplayDRM(fd);
+        if (!dpy) {
+            close(fd);
+            continue;
         }
-    }
 
-    if (drm_fd_ < 0) {
-        return;
-    }
+        int major = 0, minor = 0;
+        VAStatus status = g_va_syms.vaInitialize(dpy, &major, &minor);
+        if (status == VA_STATUS_SUCCESS) {
+            drm_fd_ = fd;
+            va_display_ = dpy;
+            is_initialized_ = true;
+            if (lifetime_) {
+                std::lock_guard<std::mutex> lock(lifetime_->mutex);
+                lifetime_->alive = true;
+            }
+            return;
+        }
 
-    // 3. Initialize VADisplay
-    VADisplay dpy = g_va_syms.vaGetDisplayDRM(drm_fd_);
-    if (!dpy) {
-        close(drm_fd_);
-        drm_fd_ = -1;
-        return;
+        if (g_va_syms.vaTerminate) {
+            g_va_syms.vaTerminate(dpy);
+        }
+        close(fd);
     }
-
-    int major = 0, minor = 0;
-    VAStatus status = g_va_syms.vaInitialize(dpy, &major, &minor);
-    if (status != VA_STATUS_SUCCESS) {
-        close(drm_fd_);
-        drm_fd_ = -1;
-        return;
-    }
-
-    va_display_ = dpy;
-    is_initialized_ = true;
 #endif
 }
 
 void VaapiDevice::close_internal() noexcept {
 #if defined(NISABA_HAS_VAAPI_HEADERS)
+    if (lifetime_) {
+        std::lock_guard<std::mutex> lock(lifetime_->mutex);
+        lifetime_->alive = false;
+    }
     if (is_initialized_ && va_display_ && g_va_syms.vaTerminate) {
         g_va_syms.vaTerminate(reinterpret_cast<VADisplay>(va_display_));
         va_display_ = nullptr;
@@ -654,28 +833,39 @@ MediaResult<void> VaapiDevice::export_surface_dma_buf(uint32_t surface_id, HwBuf
             &prime_desc
         );
         if (st == VA_STATUS_SUCCESS) {
+            desc = HwBufferDescriptor{};
             desc.width = prime_desc.width;
             desc.height = prime_desc.height;
             desc.drm_fourcc = prime_desc.fourcc;
-            if (prime_desc.num_objects > 0) {
-                for (uint32_t i = 0; i < std::min(prime_desc.num_objects, 4u); ++i) {
-                    desc.fds[i] = prime_desc.objects[i].fd;
-                    desc.modifier = prime_desc.objects[i].drm_format_modifier;
+
+            uint32_t obj_count = std::min(prime_desc.num_objects, 4u);
+            for (uint32_t i = 0; i < obj_count; ++i) {
+                desc.fds[i] = prime_desc.objects[i].fd;
+            }
+            if (obj_count > 0) {
+                desc.modifier = prime_desc.objects[0].drm_format_modifier;
+            }
+
+            uint32_t plane_idx = 0;
+            uint32_t layer_count = std::min(prime_desc.num_layers, 4u);
+            for (uint32_t l = 0; l < layer_count && plane_idx < 4; ++l) {
+                uint32_t lp_count = std::min(prime_desc.layers[l].num_planes, 4u);
+                for (uint32_t p = 0; p < lp_count && plane_idx < 4; ++p) {
+                    desc.strides[plane_idx] = prime_desc.layers[l].pitch[p];
+                    desc.offsets[plane_idx] = prime_desc.layers[l].offset[p];
+                    uint32_t obj_idx = prime_desc.layers[l].object_index[p];
+                    if (obj_idx >= obj_count) obj_idx = 0;
+                    desc.object_indices[plane_idx] = obj_idx;
+                    desc.modifiers[plane_idx] = (obj_idx < obj_count)
+                        ? prime_desc.objects[obj_idx].drm_format_modifier
+                        : desc.modifier;
+                    ++plane_idx;
                 }
             }
-            if (prime_desc.num_layers > 0) {
-                for (uint32_t l = 0; l < std::min(prime_desc.num_layers, 4u); ++l) {
-                    desc.strides[l] = prime_desc.layers[l].pitch[0];
-                    desc.offsets[l] = prime_desc.layers[l].offset[0];
-                }
-            }
+            desc.num_planes = plane_idx;
             return MediaResult<void>::ok();
         }
 #endif
-    }
-    if (drm_fd_ >= 0) {
-        desc.fds[0] = drm_fd_;
-        return MediaResult<void>::ok();
     }
 #else
     (void)surface_id; (void)desc;
@@ -683,7 +873,7 @@ MediaResult<void> VaapiDevice::export_surface_dma_buf(uint32_t surface_id, HwBuf
     return MediaError::HardwareError;
 }
 
-MediaResult<VideoFrame> VaapiDevice::derive_surface_to_frame(uint32_t surface_id, uint32_t width, uint32_t height) {
+MediaResult<VideoFrame> VaapiDevice::derive_surface_to_frame(uint32_t surface_id, uint32_t width, uint32_t height, PixelFormat preferred_format) {
     if (!is_available() || surface_id == 0xFFFFFFFF) return MediaError::InvalidData;
 
 #if defined(NISABA_HAS_VAAPI_HEADERS)
@@ -692,35 +882,49 @@ MediaResult<VideoFrame> VaapiDevice::derive_surface_to_frame(uint32_t surface_id
     bool got_pixels = false;
     VideoFrame frame;
 
+    auto copy_plane_rows = [](const uint8_t* src_plane, size_t src_stride, uint8_t* dst_plane, size_t dst_stride, uint32_t plane_h) {
+        size_t copy_bytes = std::min(src_stride, dst_stride);
+        if (src_stride == dst_stride && copy_bytes == src_stride) {
+            std::memcpy(dst_plane, src_plane, src_stride * plane_h);
+        } else {
+            for (uint32_t y = 0; y < plane_h; ++y) {
+                std::memcpy(dst_plane + y * dst_stride, src_plane + y * src_stride, copy_bytes);
+            }
+        }
+    };
+
     // Strategy 1: vaGetImage (hardware driver untiles GPU surface into clean linear memory)
     if (!got_pixels && g_va_syms.vaCreateImage && g_va_syms.vaGetImage && g_va_syms.vaMapBuffer && g_va_syms.vaUnmapBuffer && g_va_syms.vaDestroyImage) {
+        const bool prefer_10bit = (preferred_format == PixelFormat::P010 || preferred_format == PixelFormat::YUV420P10);
         VAImageFormat img_fmt{};
-        img_fmt.fourcc = VA_FOURCC_NV12;
+        img_fmt.fourcc = prefer_10bit ? VA_FOURCC_P010 : VA_FOURCC_NV12;
         img_fmt.byte_order = VA_LSB_FIRST;
-        img_fmt.bits_per_pixel = 12;
+        img_fmt.bits_per_pixel = prefer_10bit ? 24 : 12;
+        PixelFormat target_fmt = prefer_10bit ? PixelFormat::P010 : PixelFormat::NV12;
 
         VAImage img{};
         VAStatus st = g_va_syms.vaCreateImage(dpy, &img_fmt, width, height, &img);
+        if (st != VA_STATUS_SUCCESS && prefer_10bit) {
+            img_fmt.fourcc = VA_FOURCC_NV12;
+            img_fmt.bits_per_pixel = 12;
+            target_fmt = PixelFormat::NV12;
+            st = g_va_syms.vaCreateImage(dpy, &img_fmt, width, height, &img);
+        }
         if (st == VA_STATUS_SUCCESS) {
             st = g_va_syms.vaGetImage(dpy, static_cast<VASurfaceID>(surface_id), 0, 0, width, height, img.image_id);
             if (st == VA_STATUS_SUCCESS) {
                 void* pbuf = nullptr;
                 st = g_va_syms.vaMapBuffer(dpy, img.buf, &pbuf);
                 if (st == VA_STATUS_SUCCESS && pbuf) {
-                    frame = VideoFrame::allocate(width, height, PixelFormat::NV12);
-                    uint8_t* src_base = reinterpret_cast<uint8_t*>(pbuf);
+                    frame = VideoFrame::allocate(width, height, target_fmt);
+                    const uint8_t* src_base = reinterpret_cast<const uint8_t*>(pbuf);
 
                     for (uint32_t i = 0; i < img.num_planes && i < frame.plane_count(); ++i) {
-                        const uint8_t* src_plane = src_base + img.offsets[i];
-                        uint8_t* dst_plane = frame.plane_mut(i);
-                        size_t src_stride = img.pitches[i];
-                        size_t dst_stride = frame.stride(i);
-                        uint32_t plane_h = frame.plane_height(i);
-                        size_t copy_bytes = std::min(src_stride, dst_stride);
-
-                        for (uint32_t y = 0; y < plane_h; ++y) {
-                            std::memcpy(dst_plane + y * dst_stride, src_plane + y * src_stride, copy_bytes);
-                        }
+                        copy_plane_rows(
+                            src_base + img.offsets[i], img.pitches[i],
+                            frame.plane_mut(i), frame.stride(i),
+                            frame.plane_height(i)
+                        );
                     }
 
                     g_va_syms.vaUnmapBuffer(dpy, img.buf);
@@ -744,19 +948,14 @@ MediaResult<VideoFrame> VaapiDevice::derive_surface_to_frame(uint32_t surface_id
                 else if (image.format.fourcc == VA_FOURCC_P010) fmt = PixelFormat::P010;
 
                 frame = VideoFrame::allocate(width, height, fmt);
-                uint8_t* src_base = reinterpret_cast<uint8_t*>(pbuf);
+                const uint8_t* src_base = reinterpret_cast<const uint8_t*>(pbuf);
 
                 for (uint32_t i = 0; i < image.num_planes && i < frame.plane_count(); ++i) {
-                    const uint8_t* src_plane = src_base + image.offsets[i];
-                    uint8_t* dst_plane = frame.plane_mut(i);
-                    size_t src_stride = image.pitches[i];
-                    size_t dst_stride = frame.stride(i);
-                    uint32_t plane_h = frame.plane_height(i);
-                    uint32_t copy_bytes = std::min(src_stride, dst_stride);
-
-                    for (uint32_t y = 0; y < plane_h; ++y) {
-                        std::memcpy(dst_plane + y * dst_stride, src_plane + y * src_stride, copy_bytes);
-                    }
+                    copy_plane_rows(
+                        src_base + image.offsets[i], image.pitches[i],
+                        frame.plane_mut(i), frame.stride(i),
+                        frame.plane_height(i)
+                    );
                 }
 
                 g_va_syms.vaUnmapBuffer(dpy, image.buf);
@@ -769,20 +968,35 @@ MediaResult<VideoFrame> VaapiDevice::derive_surface_to_frame(uint32_t surface_id
     }
 
     if (!got_pixels) {
-        // Direct hardware-backed frame descriptor
-        frame = VideoFrame::allocate(width, height, PixelFormat::NV12);
+        frame = VideoFrame::allocate(width, height, preferred_format == PixelFormat::P010 ? PixelFormat::P010 : PixelFormat::NV12);
     }
 
     frame.set_hw_frame(true);
     frame.set_hw_surface_id(surface_id);
-
-    HwBufferDescriptor desc{};
-    if (export_surface_dma_buf(surface_id, desc).is_ok()) {
-        frame.set_dma_buf_fd(desc.fds[0]);
-    }
     return frame;
 #else
-    (void)width; (void)height;
+    (void)width; (void)height; (void)preferred_format;
+    return MediaError::NotImplemented;
+#endif
+}
+
+MediaResult<VideoFrame> VaapiDevice::create_lazy_hw_frame(
+    uint32_t surface_id,
+    uint32_t width,
+    uint32_t height,
+    PixelFormat format,
+    std::shared_ptr<void> surface_lease
+) {
+    if (!is_available() || surface_id == 0xFFFFFFFF || width == 0 || height == 0) {
+        return MediaError::InvalidData;
+    }
+#if defined(NISABA_HAS_VAAPI_HEADERS)
+    auto backing = std::make_shared<VaSurfaceBacking>(
+        this, lifetime_, surface_id, width, height, format, std::move(surface_lease)
+    );
+    return VideoFrame::from_hw_backing(width, height, format, std::move(backing));
+#else
+    (void)format; (void)surface_lease;
     return MediaError::NotImplemented;
 #endif
 }
@@ -790,26 +1004,41 @@ MediaResult<VideoFrame> VaapiDevice::derive_surface_to_frame(uint32_t surface_id
 MediaResult<void> VaapiDevice::export_buffer(const VideoFrame& frame, HwBufferDescriptor& desc) {
     if (!frame.is_valid()) return MediaError::InvalidData;
 
-    desc.width = frame.width();
-    desc.height = frame.height();
-    for (size_t i = 0; i < frame.plane_count(); ++i) {
-        desc.strides[i] = static_cast<uint32_t>(frame.stride(i));
-        desc.offsets[i] = 0;
-    }
-
-    if (frame.hw_surface_id() > 0) {
-        if (export_surface_dma_buf(frame.hw_surface_id(), desc).is_ok()) {
+    if (const auto& backing = frame.hw_backing()) {
+        if (const HwFrameBufferLayout* layout = backing->export_dma_buf(true)) {
+            desc = HwBufferDescriptor{};
+            desc.width = layout->width;
+            desc.height = layout->height;
+            desc.drm_fourcc = layout->drm_fourcc;
+            desc.num_planes = layout->num_planes;
+            for (size_t i = 0; i < 4; ++i) {
+                desc.fds[i] = layout->fds[i];
+                desc.strides[i] = layout->strides[i];
+                desc.offsets[i] = layout->offsets[i];
+                desc.modifiers[i] = layout->modifiers[i];
+                desc.object_indices[i] = layout->object_indices[i];
+            }
+            desc.modifier = layout->modifier;
             return MediaResult<void>::ok();
         }
     }
 
-    if (frame.dma_buf_fd() >= 0) {
-        desc.fds[0] = frame.dma_buf_fd();
-        return MediaResult<void>::ok();
+    uint32_t sid = frame.hw_surface_id();
+    if (sid != 0xFFFFFFFF) {
+        if (export_surface_dma_buf(sid, desc).is_ok()) {
+            return MediaResult<void>::ok();
+        }
     }
 
-    if (drm_fd_ >= 0) {
-        desc.fds[0] = drm_fd_;
+    desc.width = frame.width();
+    desc.height = frame.height();
+    desc.num_planes = static_cast<uint32_t>(frame.plane_count());
+    if (frame.dma_buf_fd() >= 0) {
+        desc.fds[0] = frame.dma_buf_fd();
+    }
+    for (size_t i = 0; i < frame.plane_count() && i < 4; ++i) {
+        desc.strides[i] = static_cast<uint32_t>(frame.stride(i));
+        desc.offsets[i] = 0;
     }
     return MediaResult<void>::ok();
 }

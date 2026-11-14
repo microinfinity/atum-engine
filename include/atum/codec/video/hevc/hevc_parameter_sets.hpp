@@ -94,6 +94,7 @@ struct HevcSps {
     uint32_t max_transform_hierarchy_depth_inter{0};
     uint32_t max_transform_hierarchy_depth_intra{0};
     uint32_t sps_max_dec_pic_buffering_minus1{0};
+    uint32_t sps_max_num_reorder_pics{0};
 
     bool scaling_list_enabled_flag{false};
     bool amp_enabled_flag{false};

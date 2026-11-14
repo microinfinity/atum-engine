@@ -19,6 +19,7 @@ VideoFrame::VideoFrame(const VideoFrame& other)
     , format_(other.format_)
     , range_(other.range_)
     , space_(other.space_)
+    , hdr_meta_(other.hdr_meta_)
     , strides_(other.strides_)
     , is_owned_(other.is_owned_) {
     pts_ = other.pts_;
@@ -45,6 +46,7 @@ VideoFrame::VideoFrame(const VideoFrame& other)
             }
         }
     } else {
+        hw_backing_ = other.hw_backing_;
         planes_ = other.planes_;
     }
 }
@@ -72,6 +74,7 @@ VideoFrame& VideoFrame::operator=(const VideoFrame& other) {
     hw_opaque_handle_ = other.hw_opaque_handle_;
 
     if (other.is_owned_) {
+        hw_backing_.reset();
         owned_buffer_ = other.owned_buffer_;
         const uint8_t* old_base = other.owned_buffer_.data();
         uint8_t* new_base = owned_buffer_.data();
@@ -85,8 +88,82 @@ VideoFrame& VideoFrame::operator=(const VideoFrame& other) {
         }
     } else {
         owned_buffer_.clear();
+        hw_backing_ = other.hw_backing_;
         planes_ = other.planes_;
     }
+    return *this;
+}
+
+VideoFrame::VideoFrame(VideoFrame&& other) noexcept
+    : Frame(MediaType::Video)
+    , width_(other.width_)
+    , height_(other.height_)
+    , format_(other.format_)
+    , range_(other.range_)
+    , space_(other.space_)
+    , hdr_meta_(other.hdr_meta_)
+    , planes_(other.planes_)
+    , strides_(other.strides_)
+    , owned_buffer_(std::move(other.owned_buffer_))
+    , is_owned_(other.is_owned_)
+    , is_hw_frame_(other.is_hw_frame_)
+    , hw_surface_id_(other.hw_surface_id_)
+    , dma_buf_fd_(other.dma_buf_fd_)
+    , hw_opaque_handle_(other.hw_opaque_handle_)
+    , hw_backing_(std::move(other.hw_backing_)) {
+    pts_ = other.pts_;
+    dts_ = other.dts_;
+    duration_ = other.duration_;
+    timebase_ = other.timebase_;
+    is_keyframe_ = other.is_keyframe_;
+
+    other.width_ = 0;
+    other.height_ = 0;
+    other.format_ = PixelFormat::Unknown;
+    other.planes_.fill(nullptr);
+    other.strides_.fill(0);
+    other.is_owned_ = false;
+    other.is_hw_frame_ = false;
+    other.hw_surface_id_ = 0xFFFFFFFF;
+    other.dma_buf_fd_ = -1;
+    other.hw_opaque_handle_ = 0;
+}
+
+VideoFrame& VideoFrame::operator=(VideoFrame&& other) noexcept {
+    if (this == &other) return *this;
+
+    width_ = other.width_;
+    height_ = other.height_;
+    format_ = other.format_;
+    range_ = other.range_;
+    space_ = other.space_;
+    hdr_meta_ = other.hdr_meta_;
+    planes_ = other.planes_;
+    strides_ = other.strides_;
+    owned_buffer_ = std::move(other.owned_buffer_);
+    is_owned_ = other.is_owned_;
+    is_hw_frame_ = other.is_hw_frame_;
+    hw_surface_id_ = other.hw_surface_id_;
+    dma_buf_fd_ = other.dma_buf_fd_;
+    hw_opaque_handle_ = other.hw_opaque_handle_;
+    hw_backing_ = std::move(other.hw_backing_);
+
+    pts_ = other.pts_;
+    dts_ = other.dts_;
+    duration_ = other.duration_;
+    timebase_ = other.timebase_;
+    is_keyframe_ = other.is_keyframe_;
+
+    other.width_ = 0;
+    other.height_ = 0;
+    other.format_ = PixelFormat::Unknown;
+    other.planes_.fill(nullptr);
+    other.strides_.fill(0);
+    other.is_owned_ = false;
+    other.is_hw_frame_ = false;
+    other.hw_surface_id_ = 0xFFFFFFFF;
+    other.dma_buf_fd_ = -1;
+    other.hw_opaque_handle_ = 0;
     return *this;
 }
 
@@ -316,6 +393,57 @@ VideoFrame VideoFrame::from_raw_planes_const(
     return frame;
 }
 
+VideoFrame VideoFrame::from_hw_backing(
+    uint32_t width,
+    uint32_t height,
+    PixelFormat format,
+    std::shared_ptr<HwFrameBacking> backing
+) noexcept {
+    VideoFrame frame;
+    frame.width_ = width;
+    frame.height_ = height;
+    frame.format_ = format;
+    frame.is_owned_ = false;
+    if (backing) {
+        frame.is_hw_frame_ = true;
+        frame.hw_surface_id_ = backing->surface_id();
+        frame.hw_backing_ = std::move(backing);
+    }
+    return frame;
+}
+
+void VideoFrame::materialize_cpu_backing() const noexcept {
+    if (planes_[0] != nullptr || !hw_backing_) return;
+    std::array<uint8_t*, MAX_PLANES> mapped_planes{};
+    std::array<size_t, MAX_PLANES> mapped_strides{};
+    PixelFormat actual_fmt = format_;
+    if (hw_backing_->ensure_cpu_mapped(actual_fmt, mapped_planes, mapped_strides)) {
+        format_ = actual_fmt;
+        planes_ = mapped_planes;
+        strides_ = mapped_strides;
+    }
+}
+
+VideoFrame VideoFrame::shallow_hw_ref() const {
+    if (hw_backing_ && !is_owned_) {
+        return *this;
+    }
+    if (hw_backing_) {
+        auto ref = from_hw_backing(width_, height_, format_, hw_backing_);
+        ref.set_color_range(range_);
+        ref.set_color_space(space_);
+        ref.set_hdr_metadata(hdr_meta_);
+        ref.set_pts(pts_);
+        ref.set_dts(dts_);
+        ref.set_duration(duration_);
+        ref.set_timebase(timebase_);
+        ref.set_keyframe(is_keyframe_);
+        ref.hw_opaque_handle_ = hw_opaque_handle_;
+        return ref;
+    }
+    return clone();
+}
+
 uint32_t VideoFrame::plane_width(size_t index) const noexcept {
     if (index == 0) return width_;
     switch (format_) {
@@ -366,11 +494,15 @@ uint32_t VideoFrame::plane_height(size_t index) const noexcept {
 void VideoFrame::ensure_owned() {
     if (is_owned_ || !is_valid()) return;
     auto cloned = clone();
-    *this = std::move(cloned);
+    if (cloned.is_valid()) {
+        *this = std::move(cloned);
+    }
 }
 
 VideoFrame VideoFrame::clone() const {
     if (!is_valid()) return VideoFrame();
+    if (!planes_[0] && hw_backing_) materialize_cpu_backing();
+    if (!planes_[0]) return VideoFrame();
     auto new_frame = allocate(width_, height_, format_);
     new_frame.set_color_range(range_);
     new_frame.set_color_space(space_);
@@ -381,23 +513,28 @@ VideoFrame VideoFrame::clone() const {
     new_frame.set_timebase(timebase_);
     new_frame.set_keyframe(is_keyframe_);
     new_frame.set_hw_frame(is_hw_frame_);
-    new_frame.set_hw_surface_id(hw_surface_id_);
+    new_frame.set_hw_surface_id(hw_surface_id());
     new_frame.set_dma_buf_fd(dma_buf_fd_);
+    new_frame.set_hw_opaque_handle(hw_opaque_handle_);
 
     size_t num_planes = plane_count();
     size_t bps = bytes_per_sample();
 
     for (size_t p = 0; p < num_planes; ++p) {
+        const uint8_t* src_p = plane(p);
+        uint8_t* dst_p = new_frame.plane_mut(p);
+        if (!src_p || !dst_p) continue;
         uint32_t h = plane_height(p);
         size_t copy_bytes = plane_width(p) * bps;
         if (format_ == PixelFormat::RGBA32 || format_ == PixelFormat::BGRA32) copy_bytes = width_ * 4;
         else if (format_ == PixelFormat::RGBA64) copy_bytes = width_ * 8;
         else if (format_ == PixelFormat::RGB24 || format_ == PixelFormat::BGR24) copy_bytes = width_ * 3;
+        copy_bytes = std::min({copy_bytes, stride(p), new_frame.stride(p)});
 
         for (uint32_t y = 0; y < h; ++y) {
             std::memcpy(
-                new_frame.plane_mut(p) + y * new_frame.stride(p),
-                plane(p) + y * stride(p),
+                dst_p + y * new_frame.stride(p),
+                src_p + y * stride(p),
                 copy_bytes
             );
         }

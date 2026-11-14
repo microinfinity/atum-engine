@@ -238,6 +238,118 @@ void test_gl_device_interface() {
     std::cout << "  -> PASS: GlDevice abstraction conforms to HwDevice contract." << std::endl;
 }
 
+void test_gl_planar_zero_copy() {
+    std::cout << "\n[Test 7] Testing Zero-Copy Planar NV12 (R8+GR88) Import & GPU CSC Render..." << std::endl;
+    auto va_dev = VaapiDevice::create();
+    if (!va_dev || !va_dev->is_available()) {
+        std::cout << "  [Notice] VA-API device not available; skipping planar DMA-BUF test." << std::endl;
+        return;
+    }
+
+    auto surfs_res = va_dev->create_surfaces(320, 240, PixelFormat::NV12, 1);
+    if (!surfs_res.is_ok()) {
+        std::cout << "  [Notice] Could not allocate VA-API surface; skipping." << std::endl;
+        return;
+    }
+    uint32_t surface_id = surfs_res.value()[0];
+
+    HwBufferDescriptor desc{};
+    auto exp_res = va_dev->export_surface_dma_buf(surface_id, desc);
+    if (!exp_res.is_ok() || desc.plane_fd(0) < 0) {
+        std::cout << "  [Notice] DMA-BUF export not supported on current node; skipping." << std::endl;
+        va_dev->destroy_surfaces(surfs_res.value());
+        return;
+    }
+
+    GlDispatcher disp;
+    auto ctx_res = EglContext::create_headless(disp);
+    assert(ctx_res.is_ok());
+    auto ctx = std::move(ctx_res.value());
+
+    GlImageImporter importer(*ctx);
+    GlRenderer renderer(*ctx);
+    assert(renderer.init().is_ok());
+
+    auto planar_res = importer.import_planar_dma_buf(desc);
+    if (planar_res.is_ok()) {
+        auto planar = std::move(planar_res.value());
+        assert(planar.is_valid());
+        assert(planar.plane_count == 2);
+        assert(planar.planes[0].target() == GL_TEXTURE_2D_VAL);
+        assert(planar.planes[1].target() == GL_TEXTURE_2D_VAL);
+
+        auto rgba_res = renderer.render_to_texture(planar, 320, 240);
+        assert(rgba_res.is_ok() && "Failed to render planar DMA-BUF textures to RGBA");
+        auto out = rgba_res.value().read_pixels_to_frame();
+        assert(out.is_ok() && out->width() == 320 && out->height() == 240);
+        std::cout << "  -> PASS: Planar R8+GR88 zero-copy import & YUV->RGB shader verified." << std::endl;
+    } else {
+        std::cout << "  [Notice] Cross-device planar DMA-BUF import rejected by current EGL node (err="
+                  << (int)planar_res.error() << ")." << std::endl;
+    }
+
+    va_dev->destroy_surfaces(surfs_res.value());
+}
+
+void test_gles_renderer_init() {
+    std::cout << "\n[Test 8] Testing Explicit OpenGL ES 3.x GlRenderer Initialization..." << std::endl;
+    GlDispatcher disp;
+    if (!disp.load_egl() || !disp.eglGetPlatformDisplayEXT) {
+        std::cout << "  [Notice] EGL platform display unavailable; skipping GLES3 test." << std::endl;
+        return;
+    }
+
+    EGLDisplay dpy = disp.eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA_VAL, EGL_DEFAULT_DISPLAY_PTR, nullptr);
+    if (dpy == EGL_NO_DISPLAY_PTR) {
+        std::cout << "  [Notice] Surfaceless EGL display unavailable; skipping GLES3 test." << std::endl;
+        return;
+    }
+
+    EGLint maj = 0;
+    EGLint min = 0;
+    if (disp.eglInitialize(dpy, &maj, &min) != EGL_TRUE_VAL ||
+        disp.eglBindAPI(EGL_OPENGL_ES_API_VAL) != EGL_TRUE_VAL) {
+        std::cout << "  [Notice] OpenGL ES API unavailable; skipping GLES3 test." << std::endl;
+        return;
+    }
+
+    EGLint cfg_attr[] = {
+        EGL_SURFACE_TYPE_VAL, EGL_PBUFFER_BIT_VAL,
+        EGL_RENDERABLE_TYPE_VAL, EGL_OPENGL_ES2_BIT_VAL,
+        EGL_NONE_VAL
+    };
+    EGLConfig cfg = nullptr;
+    EGLint ncfg = 0;
+    if (disp.eglChooseConfig(dpy, cfg_attr, &cfg, 1, &ncfg) != EGL_TRUE_VAL || ncfg == 0) {
+        disp.eglTerminate(dpy);
+        std::cout << "  [Notice] No OpenGL ES EGLConfig available; skipping GLES3 test." << std::endl;
+        return;
+    }
+
+    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION_VAL, 3, EGL_NONE_VAL };
+    EGLContext raw_ctx = disp.eglCreateContext(dpy, cfg, EGL_NO_CONTEXT_PTR, ctx_attr);
+    EGLint pbuf_attr[] = { EGL_WIDTH_VAL, 1, EGL_HEIGHT_VAL, 1, EGL_NONE_VAL };
+    EGLSurface pbuf = disp.eglCreatePbufferSurface(dpy, cfg, pbuf_attr);
+    if (raw_ctx != EGL_NO_CONTEXT_PTR && pbuf != EGL_NO_SURFACE_PTR) {
+        disp.eglMakeCurrent(dpy, pbuf, pbuf, raw_ctx);
+        (void)disp.load_gl(dpy);
+        auto wrapped_res = EglContext::wrap_external(disp, dpy, raw_ctx, pbuf);
+        assert(wrapped_res.is_ok());
+
+        GlRenderer renderer(*wrapped_res.value());
+        auto init_res = renderer.init();
+        assert(init_res.is_ok() && "GlRenderer::init() failed on OpenGL ES 3.x context");
+        assert(renderer.is_initialized());
+        std::cout << "  -> PASS: GlRenderer initialized cleanly on OpenGL ES 3.x ("
+                  << wrapped_res.value()->gl_version() << ")." << std::endl;
+    }
+
+    disp.eglMakeCurrent(dpy, EGL_NO_SURFACE_PTR, EGL_NO_SURFACE_PTR, EGL_NO_CONTEXT_PTR);
+    if (pbuf != EGL_NO_SURFACE_PTR) disp.eglDestroySurface(dpy, pbuf);
+    if (raw_ctx != EGL_NO_CONTEXT_PTR) disp.eglDestroyContext(dpy, raw_ctx);
+    disp.eglTerminate(dpy);
+}
+
 int main() {
     std::cout << "============================================================" << std::endl;
     std::cout << "       ATUM MEDIA ENGINE: OPENGL / EGL INTEROP SUITE        " << std::endl;
@@ -249,9 +361,11 @@ int main() {
     test_gl_renderer_pipeline();
     test_gl_dma_buf_zero_copy();
     test_gl_device_interface();
+    test_gl_planar_zero_copy();
+    test_gles_renderer_init();
 
     std::cout << "\n============================================================" << std::endl;
-    std::cout << "   ALL 6 OPENGL INTEROP TEST CASES COMPLETED SUCCESSFULLY!  " << std::endl;
+    std::cout << "   ALL 8 OPENGL INTEROP TEST CASES COMPLETED SUCCESSFULLY!  " << std::endl;
     std::cout << "============================================================" << std::endl;
     return 0;
 }

@@ -43,41 +43,33 @@ std::unique_ptr<GlDevice> GlDevice::create() {
 }
 
 MediaResult<void> GlDevice::export_buffer(const VideoFrame& frame, HwBufferDescriptor& desc) {
-    if (!frame.is_valid()) {
-        return MediaError::InvalidData;
+    auto desc_res = GlImageImporter::descriptor_from_frame(frame);
+    if (!desc_res.is_ok()) {
+        return desc_res.error();
     }
-
-    if (frame.is_hw_frame() && frame.dma_buf_fd() >= 0) {
-        desc.fds[0] = frame.dma_buf_fd();
-        desc.width = frame.width();
-        desc.height = frame.height();
-        desc.strides[0] = static_cast<uint32_t>(frame.stride(0));
-        desc.offsets[0] = 0;
-        desc.modifier = DRM_FORMAT_MOD_LINEAR_VAL;
-
-        if (frame.pixel_format() == PixelFormat::NV12) {
-            desc.drm_fourcc = DRM_FOURCC_NV12;
-            desc.fds[1] = frame.dma_buf_fd();
-            desc.offsets[1] = static_cast<uint32_t>(frame.height() * frame.stride(0));
-            desc.strides[1] = static_cast<uint32_t>(frame.stride(1) > 0 ? frame.stride(1) : frame.stride(0));
-        } else if (frame.pixel_format() == PixelFormat::P010) {
-            desc.drm_fourcc = DRM_FOURCC_P010;
-            desc.fds[1] = frame.dma_buf_fd();
-            desc.offsets[1] = static_cast<uint32_t>(frame.height() * frame.stride(0));
-            desc.strides[1] = static_cast<uint32_t>(frame.stride(1) > 0 ? frame.stride(1) : frame.stride(0));
-        } else {
-            desc.drm_fourcc = DRM_FOURCC_RGBA8888;
-        }
-
-        return MediaResult<void>::ok();
-    }
-
-    return MediaError::UnsupportedFormat;
+    desc = desc_res.value();
+    return MediaResult<void>::ok();
 }
 
 MediaResult<VideoFrame> GlDevice::import_buffer(const HwBufferDescriptor& desc) {
     if (!importer_) {
         return MediaError::InvalidState;
+    }
+
+    const bool is_planar_yuv =
+        desc.drm_fourcc == DRM_FOURCC_NV12 ||
+        desc.drm_fourcc == DRM_FOURCC_NV21 ||
+        desc.drm_fourcc == DRM_FOURCC_P010 ||
+        desc.drm_fourcc == DRM_FOURCC_YUV420;
+
+    if (is_planar_yuv && renderer_) {
+        auto planar_res = importer_->import_planar_dma_buf(desc);
+        if (planar_res.is_ok()) {
+            auto rgba_res = renderer_->render_to_texture(planar_res.value(), desc.width, desc.height);
+            if (rgba_res.is_ok()) {
+                return rgba_res.value().read_pixels_to_frame();
+            }
+        }
     }
 
     auto tex_res = importer_->import_dma_buf(desc);

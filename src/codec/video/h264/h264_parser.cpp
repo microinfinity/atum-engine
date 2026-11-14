@@ -49,7 +49,7 @@ MediaResult<void> H264Parser::parse_extradata(std::span<const uint8_t> extradata
                 nal.forbidden_zero_bit = (sps_span[0] >> 7) & 1;
                 nal.ref_idc = (sps_span[0] >> 5) & 3;
                 nal.type = sps_span[0] & 0x1F;
-                nal.payload = sps_span.subspan(1);
+                nal.payload = sps_span;
                 auto res = parse_nal(nal);
                 if (!res) return res.error();
             }
@@ -70,7 +70,7 @@ MediaResult<void> H264Parser::parse_extradata(std::span<const uint8_t> extradata
                     nal.forbidden_zero_bit = (pps_span[0] >> 7) & 1;
                     nal.ref_idc = (pps_span[0] >> 5) & 3;
                     nal.type = pps_span[0] & 0x1F;
-                    nal.payload = pps_span.subspan(1);
+                    nal.payload = pps_span;
                     auto res = parse_nal(nal);
                     if (!res) return res.error();
                 }
@@ -87,14 +87,17 @@ MediaResult<void> H264Parser::parse_nal(const NalUnit& nal) {
     auto nal_type = static_cast<H264NalType>(nal.type);
     if (nal.payload.empty()) return {};
 
-    auto rbsp = NalParser::ebsp_to_rbsp(nal.payload);
-    std::span<const uint8_t> rbsp_payload = rbsp;
-    if (!rbsp_payload.empty() && (rbsp_payload[0] & 0x1F) == nal.type) {
-        rbsp_payload = rbsp_payload.subspan(1);
+    // Strip the 1-byte NAL header when payload begins with it (all standard parsers provide it).
+    std::span<const uint8_t> raw_ebsp = nal.payload;
+    if ((raw_ebsp[0] & 0x1F) == nal.type &&
+        ((raw_ebsp[0] >> 5) & 3) == nal.ref_idc &&
+        ((raw_ebsp[0] >> 7) & 1) == nal.forbidden_zero_bit) {
+        raw_ebsp = raw_ebsp.subspan(1);
     }
 
     if (nal_type == H264NalType::Sps) {
-        auto sps_res = H264Sps::parse_rbsp(rbsp_payload);
+        auto rbsp = NalParser::ebsp_to_rbsp(raw_ebsp);
+        auto sps_res = H264Sps::parse_rbsp(rbsp);
         if (!sps_res) return sps_res.error();
         uint32_t id = sps_res->seq_parameter_set_id;
         sps_map_[id] = std::move(*sps_res);
@@ -105,7 +108,8 @@ MediaResult<void> H264Parser::parse_nal(const NalUnit& nal) {
     }
 
     if (nal_type == H264NalType::Pps) {
-        auto pps_res = H264Pps::parse_rbsp(rbsp_payload);
+        auto rbsp = NalParser::ebsp_to_rbsp(raw_ebsp);
+        auto pps_res = H264Pps::parse_rbsp(rbsp);
         if (!pps_res) return pps_res.error();
         uint32_t id = pps_res->pic_parameter_set_id;
         pps_map_[id] = std::move(*pps_res);
@@ -123,7 +127,22 @@ MediaResult<void> H264Parser::parse_nal(const NalUnit& nal) {
             return {};
         }
 
-        BitReader reader(rbsp_payload);
+        // Only unescape the header prefix on the stack instead of copying the entire slice payload.
+        uint8_t header_rbsp[512];
+        size_t header_rbsp_len = 0;
+        const size_t scan_limit = std::min<size_t>(raw_ebsp.size(), 512);
+        size_t zero_count = 0;
+        for (size_t i = 0; i < scan_limit; ++i) {
+            uint8_t b = raw_ebsp[i];
+            if (zero_count >= 2 && b == 0x03 && i + 1 < raw_ebsp.size() && raw_ebsp[i + 1] <= 0x03) {
+                zero_count = 0;
+                continue;
+            }
+            zero_count = (b == 0x00) ? (zero_count + 1) : 0;
+            header_rbsp[header_rbsp_len++] = b;
+        }
+
+        BitReader reader(std::span<const uint8_t>(header_rbsp, header_rbsp_len));
         auto slice_res = H264SliceHeader::parse(reader, nal_type, *sps, *pps, nal.ref_idc);
         if (slice_res) {
             if (slice_res->pic_parameter_set_id != pps->pic_parameter_set_id) {
@@ -137,9 +156,6 @@ MediaResult<void> H264Parser::parse_nal(const NalUnit& nal) {
                 }
             }
             last_slice_ = *slice_res;
-            reader.align_to_byte();
-            auto remaining = reader.remaining_bytes();
-            last_slice_data_.assign(remaining.begin(), remaining.end());
         }
         return {};
     }
